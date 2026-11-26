@@ -1260,3 +1260,177 @@ TEST(TestContractQvault, treasuryProposals)
     EXPECT_EQ(getBalance(destination), 1000000000);
     EXPECT_EQ(state->reinvestingFund, fund - 1000000000ull - 2 * transferFee);
 }
+
+// QVAULT plus TESTEXA, a test contract that runs shareholder polls
+class ContractTestingQvaultPoll : public ContractTestingQvault
+{
+public:
+    ContractTestingQvaultPoll()
+    {
+        INIT_CONTRACT(TESTEXA);
+        callSystemProcedure(TESTEXA_CONTRACT_INDEX, INITIALIZE);
+    }
+
+    uint32 submitPollP(const id& address, uint64 shareAssetName, uint32 contractIndex, uint32 pollTick, uint16 pollIndex, uint16 pollType, uint8 numberOfOptions)
+    {
+        QVAULT::submitPollP_input input;
+        QVAULT::submitPollP_output output;
+        setMemory(input, 0);
+        input.shareAssetName = shareAssetName;
+        input.contractIndex = contractIndex;
+        input.pollTick = pollTick;
+        input.pollIndex = pollIndex;
+        input.pollType = pollType;
+        input.numberOfOptions = numberOfOptions;
+        invokeUserProcedure(QVAULT_CONTRACT_INDEX, 15, input, output, address, QVAULT_PROPOSAL_FEE);
+        return output.returnCode;
+    }
+
+    QVAULT::voteInPollP_output voteInPollP(const id& address, uint32 proposalId, uint8 option)
+    {
+        QVAULT::voteInPollP_input input{ proposalId, option };
+        QVAULT::voteInPollP_output output;
+        setMemory(output, 0);
+        invokeUserProcedure(QVAULT_CONTRACT_INDEX, 16, input, output, address, 0);
+        return output;
+    }
+
+    QVAULT::getPollP_output getPollP(uint32 proposalId) const
+    {
+        QVAULT::getPollP_input input{ proposalId };
+        QVAULT::getPollP_output output;
+        callFunction(QVAULT_CONTRACT_INDEX, 24, input, output);
+        return output;
+    }
+
+    QVAULT::getVoteInProposal_output getVoteInProposal(const id& user, uint64 proposalType, uint64 proposalId) const
+    {
+        QVAULT::getVoteInProposal_input input{ user, proposalType, proposalId };
+        QVAULT::getVoteInProposal_output output;
+        callFunction(QVAULT_CONTRACT_INDEX, 21, input, output);
+        return output;
+    }
+
+    // yes/no poll in TESTEXA about setting its variable 3 to 100
+    uint16 openTestExAPoll(const id& proposer)
+    {
+        TESTEXA::SetShareholderProposal_input input;
+        setMemory(input, 0);
+        input.proposalData.epoch = system.epoch;
+        input.proposalData.type = ProposalTypes::VariableYesNo;
+        input.proposalData.data.variableOptions.variable = 2;
+        input.proposalData.data.variableOptions.value = 100;
+        TESTEXA::SetShareholderProposal_output output;
+        invokeUserProcedure(TESTEXA_CONTRACT_INDEX, 65534, input, output, proposer, 0);
+        return output;
+    }
+
+    TESTEXA::GetShareholderProposal_output getTestExAPoll(uint16 pollIndex) const
+    {
+        TESTEXA::GetShareholderProposal_input input{ pollIndex };
+        TESTEXA::GetShareholderProposal_output output;
+        callFunction(TESTEXA_CONTRACT_INDEX, 65533, input, output);
+        return output;
+    }
+
+    // votes QVAULT cast in the TESTEXA poll for the given value
+    uint32 qvaultVotesInTestExAPoll(uint16 pollIndex, sint64 value) const
+    {
+        TESTEXA::GetShareholderVotes_input input{ QVAULT_CONTRACT_ID, pollIndex };
+        TESTEXA::GetShareholderVotes_output output;
+        callFunction(TESTEXA_CONTRACT_INDEX, 65534, input, output);
+        uint32 count = 0;
+        for (int i = 0; i < output.voteCounts.capacity(); ++i)
+        {
+            if (output.voteValues.get(i) == value)
+                count += output.voteCounts.get(i);
+        }
+        return count;
+    }
+};
+
+TEST(TestContractQvault, pollProposalCastsSharesLive)
+{
+    system.epoch = 200;
+    ContractTestingQvaultPoll qvault;
+
+    const uint64 qcapAssetName = assetNameFromString("QCAP");
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_ISSUE_ASSET_FEE);
+    EXPECT_EQ(qvault.issueAsset(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, 0, 0), QVAULT_QCAP_MAX_SUPPLY);
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID), QVAULT_QCAP_MAX_SUPPLY);
+
+    // stakers A (6000) and B (4000)
+    const id stakerA = getUser(1);
+    const id stakerB = getUser(2);
+    const id stakers[2] = { stakerA, stakerB };
+    const uint32 amounts[2] = { 6000, 4000 };
+    for (int i = 0; i < 2; i++)
+    {
+        increaseEnergy(QVAULT_CONTRACT_ID, QVAULT_TOKEN_TRANSFER_FEE);
+        EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, amounts[i], QVAULT_CONTRACT_ID, stakers[i]), amounts[i]);
+        increaseEnergy(stakers[i], QVAULT_UNSTAKE_FEE);
+        EXPECT_EQ(qvault.QXTransferShareManagementRights(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_CONTRACT_INDEX, amounts[i], stakers[i]), amounts[i]);
+        EXPECT_EQ(qvault.stake(stakers[i], amounts[i]), QVAULT_SUCCESS);
+    }
+    qvault.endEpoch();
+    system.epoch++;
+
+    // QVAULT owns 100 of the 676 TESTEXA shares; a shareholder opens a yes/no poll
+    const id shareholder = getUser(10);
+    std::vector<std::pair<m256i, unsigned int>> shares{ { shareholder, 576 }, { QVAULT_CONTRACT_ID, 100 } };
+    issueContractShares(TESTEXA_CONTRACT_INDEX, shares);
+    const uint64 testExAName = assetNameFromString("TESTEXA");
+    const uint16 pollIndex = qvault.openTestExAPoll(shareholder);
+    ASSERT_NE((int)pollIndex, (int)INVALID_PROPOSAL_INDEX);
+    const auto poll = qvault.getTestExAPoll(pollIndex).proposal;
+    ASSERT_EQ((int)poll.type, (int)ProposalTypes::VariableYesNo);
+
+    // create the matching QVAULT poll proposal
+    increaseEnergy(stakerA, QVAULT_PROPOSAL_FEE * 5);
+    EXPECT_EQ(qvault.submitPollP(stakerA, assetNameFromString("NOPE"), TESTEXA_CONTRACT_INDEX, poll.tick, pollIndex, poll.type, 2), QVAULT_INSUFFICIENT_SHARE); // QVAULT holds no such shares
+    EXPECT_EQ(qvault.submitPollP(stakerA, testExAName, TESTEXA_CONTRACT_INDEX, poll.tick, pollIndex, poll.type, 1), QVAULT_INPUT_ERROR);                       // too few options
+    EXPECT_EQ(qvault.submitPollP(stakerA, testExAName, TESTEXA_CONTRACT_INDEX, poll.tick, pollIndex, poll.type, 2), QVAULT_SUCCESS);
+    EXPECT_EQ(qvault.submitPollP(stakerA, testExAName, TESTEXA_CONTRACT_INDEX, poll.tick, pollIndex, poll.type, 2), QVAULT_INPUT_ERROR);                       // duplicate
+    EXPECT_EQ(qvault.getPollP(0).numberOfPollP, 1u);
+    EXPECT_EQ((int)qvault.getPollP(0).proposal.castOption, -1);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 0) + qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 0u);
+
+    // B votes yes: QVAULT casts all 100 shares for yes
+    auto voted = qvault.voteInPollP(stakerB, 0, 1);
+    EXPECT_EQ(voted.returnCode, QVAULT_SUCCESS);
+    EXPECT_EQ((int)voted.castOption, 1);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 100u);
+
+    // A (more voting power) votes no: QVAULT switches to no
+    voted = qvault.voteInPollP(stakerA, 0, 0);
+    EXPECT_EQ((int)voted.castOption, 0);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 0), 100u);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 0u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(0), 6000u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(1), 4000u);
+
+    // A changes to yes: QVAULT back to yes, A's power moves
+    voted = qvault.voteInPollP(stakerA, 0, 1);
+    EXPECT_EQ((int)voted.castOption, 1);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 100u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(0), 0u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(1), 10000u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.totalVotes, 10000u);
+    EXPECT_EQ(qvault.getVoteInProposal(stakerA, QVAULT_PROPOSAL_TYPE_POLL, 0).votingDecision, 1);
+
+    // refused votes
+    EXPECT_EQ(qvault.voteInPollP(stakerA, 0, 1).returnCode, QVAULT_SAME_DECISION);
+    EXPECT_EQ(qvault.voteInPollP(stakerB, 0, 2).returnCode, QVAULT_INPUT_ERROR);       // only options 0 and 1
+    EXPECT_EQ(qvault.voteInPollP(getUser(3), 0, 1).returnCode, QVAULT_NO_VOTING_POWER);
+    EXPECT_EQ(qvault.voteInPollP(stakerA, 1, 1).returnCode, QVAULT_OVERFLOW_PROPOSAL);
+
+    // end of epoch records the outcome
+    qvault.endEpoch();
+    EXPECT_EQ(qvault.getPollP(0).proposal.result, QVAULT_POLL_VOTED);
+    EXPECT_EQ((int)qvault.getPollP(0).proposal.castOption, 1);
+
+    // closed in later epochs
+    system.epoch++;
+    EXPECT_EQ(qvault.voteInPollP(stakerB, 0, 0).returnCode, QVAULT_ENDED_PROPOSAL);
+}

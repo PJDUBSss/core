@@ -33,6 +33,10 @@ constexpr uint32 QVAULT_PROPOSAL_TYPE_TREASURY = 8;             // proposalType 
 constexpr uint8 QVAULT_TREASURY_SEND_QU = 1;                    // Send Qu from the reinvesting fund to the destination
 constexpr uint8 QVAULT_TREASURY_SEND_ASSET = 2;                 // Send QX-managed shares QVAULT owns (QCAP included) to the destination
 constexpr uint8 QVAULT_TREASURY_SELL_ASSET = 3;                 // Place a QX ask order for QX-managed shares QVAULT owns (not QCAP)
+// Poll proposals (PollP): QCAP stakers decide how QVAULT casts its shares in a shareholder poll of another contract
+constexpr uint32 QVAULT_MAX_NUMBER_OF_POLL_PROPOSAL = 4096;     // Maximum number of poll proposals
+constexpr uint32 QVAULT_PROPOSAL_TYPE_POLL = 9;                 // proposalType of PollP in the per-user vote history / getVoteInProposal
+constexpr uint8 QVAULT_POLL_MAX_OPTIONS = 8;                    // Options 0 (no) to 7, as in ProposalMultiVoteDataV1
 
 // Yearly QCAP sale limits
 constexpr uint32 QVAULT_2025MAX_QCAP_SALE_AMOUNT = 10714286; // Maximum QCAP sales for 2025
@@ -74,6 +78,8 @@ constexpr uint8 QVAULT_PROPOSAL_INSUFFICIENT_VOTING_POWER = 3;
 constexpr uint8 QVAULT_PROPOSAL_INSUFFICIENT_QCAP = 4;
 constexpr uint8 QVAULT_PROPOSAL_NOT_STARTED = 5;
 constexpr uint8 QVAULT_PROPOSAL_EXECUTION_FAILED = 6;   // Passed, but could not be carried out (not enough funds or shares, or over the QCAP sale limit)
+constexpr uint8 QVAULT_POLL_VOTED = 0;                  // PollP result: QVAULT cast its shares for castOption
+constexpr uint8 QVAULT_POLL_NO_VOTES = 1;               // PollP result: no staker voted, QVAULT did not vote
 
 /**
  * QVAULT2 - Placeholder struct for future use
@@ -260,6 +266,29 @@ struct QVAULT : public ContractBase
     };
 
     /**
+    * Poll Proposal (PollP) information structure
+    * Mirrors a shareholder poll of another contract in which QVAULT holds shares.
+    * Stakers pick an option; QVAULT casts all its shares for the leading option, updated after every vote.
+    */
+    struct PollPInfo
+    {
+        id proposer;                    // Address of the proposal creator
+        uint64 shareAssetName;          // Asset name of the contract's shares (e.g. QPUMP), issuer NULL_ID
+        uint32 currentTotalVotingPower; // Total voting power when proposal was created
+        uint32 proposedEpoch;           // Epoch when proposal was created (polls are open during one epoch)
+        uint32 contractIndex;           // Contract running the shareholder poll
+        uint32 pollTick;                // Tick the poll was set in (must match the poll's current version)
+        uint32 totalVotes;              // Voting power of all stakers who voted
+        uint16 pollIndex;               // Index of the shareholder proposal in that contract
+        uint16 pollType;                // ProposalTypes type of the shareholder proposal
+        Array<uint32, QVAULT_POLL_MAX_OPTIONS> optionVotes; // Voting power per option (0 = no, 1..N = options of the poll)
+        Array<uint8, QVAULT_MAX_URLS_COUNT> url;          // URL containing proposal details
+        uint8 numberOfOptions;          // Number of options of the poll (2..8)
+        sint8 castOption;               // Option QVAULT's shares are currently cast for, -1 if none
+        uint8 result;                   // 0 = QVAULT voted (castOption), 1 = no staker voted, 5 = not started
+    };
+
+    /**
     * Vote status information structure
     * Tracks individual user votes on proposals
     */
@@ -348,6 +377,8 @@ struct QVAULT : public ContractBase
         // Appended in v2.1 (state extended with PADDING, existing variables unchanged)
         Array<TreasuryPInfo, QVAULT_MAX_NUMBER_OF_TREASURY_PROPOSAL> TreasuryP; // Storage array for treasury proposals
         uint32 numberOfTreasuryP;           // Number of Treasury Proposals
+        Array<PollPInfo, QVAULT_MAX_NUMBER_OF_POLL_PROPOSAL> PollP;               // Storage array for poll proposals
+        uint32 numberOfPollP;               // Number of Poll Proposals
     };
 public:
 
@@ -625,6 +656,58 @@ public:
     struct submitTreasuryP_output
     {
         sint32 returnCode;
+    };
+
+    /**
+     * Input structure for submitPollP (Poll Proposal) function
+     * @param shareAssetName Asset name of the contract's shares QVAULT holds (e.g. QPUMP)
+     * @param contractIndex Contract running the shareholder poll
+     * @param pollTick Tick the poll was set in (from the contract's GetShareholderProposal)
+     * @param pollIndex Index of the shareholder proposal in that contract
+     * @param pollType ProposalTypes type of the shareholder proposal
+     * @param numberOfOptions Number of options of the poll including option 0 (no), 2..8
+     * @param url URL containing proposal details (max 256 bytes)
+     */
+    struct submitPollP_input
+    {
+        uint64 shareAssetName;
+        uint32 contractIndex;
+        uint32 pollTick;
+        uint16 pollIndex;
+        uint16 pollType;
+        uint8 numberOfOptions;
+        Array<uint8, QVAULT_MAX_URLS_COUNT> url;
+    };
+
+    /**
+     * Output structure for submitPollP function
+     * @param returnCode Status code indicating success or failure
+     */
+    struct submitPollP_output
+    {
+        sint32 returnCode;
+    };
+
+    /**
+     * Input structure for voteInPollP function
+     * @param proposalId ID of the poll proposal
+     * @param option Option to vote for (0 = no, 1..N)
+     */
+    struct voteInPollP_input
+    {
+        uint32 proposalId;
+        uint8 option;
+    };
+
+    /**
+     * Output structure for voteInPollP function
+     * @param castOption Option QVAULT's shares are cast for after this vote (-1 if none)
+     * @param returnCode Status code indicating success or failure
+     */
+    struct voteInPollP_output
+    {
+        sint32 returnCode;
+        sint8 castOption;
     };
 
     /**
@@ -1915,6 +1998,296 @@ public:
     }
 
     /**
+     * Local variables for submitPollP function
+     */
+    struct submitPollP_locals
+    {
+        Asset qvaultShare;              // QVAULT share asset information
+        Asset pollShare;                // Shares of the contract running the poll
+        PollPInfo newProposal;          // New poll proposal to create
+        sint32 _t;                      // Loop counter variable
+    };
+
+    /**
+     * Submits a Poll Proposal (PollP) for a shareholder poll of another contract in which QVAULT holds shares
+     * Meant to be created (e.g. by a bot) as soon as the poll appears. Same requirements as other proposals:
+     * minimum voting power (10000) or QVAULT shares, and the proposal fee. One PollP per poll and epoch.
+     *
+     * @param input Poll reference, number of options and URL containing proposal details
+     * @param output Status code indicating success or failure
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(submitPollP)
+    {
+        locals.qvaultShare.assetName = QVAULT_QVAULT_ASSETNAME;
+        locals.qvaultShare.issuer = NULL_ID;
+
+        for (locals._t = 0 ; locals._t < (sint64)state.get().numberOfVotingPower; locals._t++)
+        {
+            if (state.get().votingPower.get(locals._t).stakerAddress == qpi.invocator())
+            {
+                if (state.get().votingPower.get(locals._t).amount >= QVAULT_MIN_VOTING_POWER)
+                {
+                    break;
+                }
+                else
+                {
+                    if (qpi.numberOfShares(locals.qvaultShare, AssetOwnershipSelect::byOwner(qpi.invocator()), AssetPossessionSelect::byPossessor(qpi.invocator())) <= 0)
+                    {
+                        output.returnCode = QVAULT_INSUFFICIENT_VOTING_POWER;
+                        if (qpi.invocationReward() > 0)
+                        {
+                            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                        }
+                        return ;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (locals._t == state.get().numberOfVotingPower && qpi.numberOfShares(locals.qvaultShare, AssetOwnershipSelect::byOwner(qpi.invocator()), AssetPossessionSelect::byPossessor(qpi.invocator())) <= 0)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_NO_VOTING_POWER;
+            return ;
+        }
+
+        if (input.numberOfOptions < 2 || input.numberOfOptions > QVAULT_POLL_MAX_OPTIONS || input.contractIndex == 0 || input.contractIndex == SELF_INDEX)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+
+        // one PollP per poll in an epoch, so stakers' votes are not split across duplicates
+        for (locals._t = state.get().numberOfPollP - 1; locals._t >= 0; locals._t--)
+        {
+            if (state.get().PollP.get(locals._t).proposedEpoch != qpi.epoch())
+            {
+                break;
+            }
+            if (state.get().PollP.get(locals._t).contractIndex == input.contractIndex && state.get().PollP.get(locals._t).pollIndex == input.pollIndex)
+            {
+                if (qpi.invocationReward() > 0)
+                {
+                    qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                }
+                output.returnCode = QVAULT_INPUT_ERROR;
+                return ;
+            }
+        }
+
+        locals.pollShare.assetName = input.shareAssetName;
+        locals.pollShare.issuer = NULL_ID;
+        if (qpi.numberOfShares(locals.pollShare, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) <= 0)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INSUFFICIENT_SHARE;
+            return ;
+        }
+
+        if (qpi.invocationReward() < QVAULT_PROPOSAL_FEE)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INSUFFICIENT_FUND;
+            return ;
+        }
+        if (state.get().numberOfPollP >= QVAULT_MAX_NUMBER_OF_POLL_PROPOSAL)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+            return ;
+        }
+        if (qpi.invocationReward() > QVAULT_PROPOSAL_FEE)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward() - QVAULT_PROPOSAL_FEE);
+        }
+        state.mut().proposalCreateFund += QVAULT_PROPOSAL_FEE;
+
+        locals.newProposal.currentQuorumPercent = state.get().quorumPercent;
+        locals.newProposal.currentTotalVotingPower = state.get().totalVotingPower;
+        for (locals._t = 0; locals._t < QVAULT_MAX_URLS_COUNT; locals._t++)
+        {
+            locals.newProposal.url.set(locals._t, input.url.get(locals._t));
+        }
+        locals.newProposal.proposedEpoch = qpi.epoch();
+        locals.newProposal.proposer = qpi.invocator();
+        locals.newProposal.result = QVAULT_PROPOSAL_NOT_STARTED;
+        locals.newProposal.castOption = -1;
+        locals.newProposal.totalVotes = 0;
+
+        locals.newProposal.shareAssetName = input.shareAssetName;
+        locals.newProposal.contractIndex = input.contractIndex;
+        locals.newProposal.pollTick = input.pollTick;
+        locals.newProposal.pollIndex = input.pollIndex;
+        locals.newProposal.pollType = input.pollType;
+        locals.newProposal.numberOfOptions = input.numberOfOptions;
+
+        state.mut().PollP.set(state.get().numberOfPollP, locals.newProposal);
+        state.mut().numberOfPollP++;
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
+     * Local variables for voteInPollP function
+     */
+    struct voteInPollP_locals
+    {
+        PollPInfo poll;                                         // Poll proposal being voted on
+        Array<voteStatusInfo, QVAULT_MAX_USER_VOTES> voteList;  // Vote history of the user in this epoch
+        voteStatusInfo newVote;                                 // Vote entry of the user for this poll
+        ProposalMultiVoteDataV1 voteData;                       // QVAULT's vote in the other contract
+        uint32 power;                                           // Voting power of the user
+        uint32 leaderVotes;                                     // Votes of the leading option
+        sint32 _t;                                              // Loop counter variable
+        sint32 existing;                                        // Index of the user's earlier vote on this poll, -1 if none
+        sint32 leader;                                          // Leading option, -1 if none
+        uint8 countOfVote;                                      // Number of votes of the user in this epoch
+    };
+
+    /**
+     * Votes for an option of a Poll Proposal with the staker's voting power
+     * A staker can change their option while the poll is open. After every vote QVAULT casts all of its shares
+     * for the leading option (ties keep the current option), so the poll always reflects the stakers' result.
+     *
+     * @param input Poll proposal ID and option
+     * @param output Status code and the option QVAULT's shares are cast for
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(voteInPollP)
+    {
+        if (qpi.invocationReward() > 0)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        }
+        if (input.proposalId >= state.get().numberOfPollP)
+        {
+            output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+            return ;
+        }
+        locals.poll = state.get().PollP.get(input.proposalId);
+        output.castOption = locals.poll.castOption;
+        if (locals.poll.proposedEpoch != qpi.epoch())
+        {
+            output.returnCode = QVAULT_ENDED_PROPOSAL;
+            return ;
+        }
+        if (input.option >= locals.poll.numberOfOptions)
+        {
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+
+        locals.power = 0;
+        for (locals._t = 0 ; locals._t < (sint32)state.get().numberOfVotingPower; locals._t++)
+        {
+            if (state.get().votingPower.get(locals._t).stakerAddress == qpi.invocator())
+            {
+                locals.power = state.get().votingPower.get(locals._t).amount;
+                break;
+            }
+        }
+        if (locals.power == 0)
+        {
+            output.returnCode = QVAULT_NO_VOTING_POWER;
+            return ;
+        }
+
+        // the option is kept in priceOfIPO of the user's vote history entry
+        locals.existing = -1;
+        locals.countOfVote = 0;
+        if (state.get().countOfVote.get(qpi.invocator(), locals.countOfVote))
+        {
+            state.get().vote.get(qpi.invocator(), locals.voteList);
+            for (locals._t = 0; locals._t < locals.countOfVote; locals._t++)
+            {
+                if (locals.voteList.get(locals._t).proposalType == QVAULT_PROPOSAL_TYPE_POLL && locals.voteList.get(locals._t).proposalId == input.proposalId)
+                {
+                    locals.existing = locals._t;
+                }
+            }
+        }
+
+        if (locals.existing >= 0)
+        {
+            if (locals.voteList.get(locals.existing).priceOfIPO == input.option)
+            {
+                output.returnCode = QVAULT_SAME_DECISION;
+                return ;
+            }
+            locals.poll.optionVotes.set((uint32)locals.voteList.get(locals.existing).priceOfIPO, locals.poll.optionVotes.get((uint32)locals.voteList.get(locals.existing).priceOfIPO) - locals.power);
+            locals.newVote = locals.voteList.get(locals.existing);
+            locals.newVote.priceOfIPO = input.option;
+            locals.voteList.set(locals.existing, locals.newVote);
+        }
+        else
+        {
+            if (locals.countOfVote >= QVAULT_MAX_USER_VOTES)
+            {
+                output.returnCode = QVAULT_OVERFLOW_VOTES;
+                return ;
+            }
+            locals.newVote.proposalId = input.proposalId;
+            locals.newVote.proposalType = QVAULT_PROPOSAL_TYPE_POLL;
+            locals.newVote.decision = 1;
+            locals.newVote.priceOfIPO = input.option;
+            locals.voteList.set(locals.countOfVote, locals.newVote);
+            state.mut().countOfVote.set(qpi.invocator(), locals.countOfVote + 1);
+            locals.poll.totalVotes += locals.power;
+        }
+        state.mut().vote.set(qpi.invocator(), locals.voteList);
+        locals.poll.optionVotes.set(input.option, locals.poll.optionVotes.get(input.option) + locals.power);
+
+        // leading option; on a tie the option QVAULT already voted for stays
+        locals.leader = -1;
+        locals.leaderVotes = 0;
+        for (locals._t = 0; locals._t < locals.poll.numberOfOptions; locals._t++)
+        {
+            if (locals.poll.optionVotes.get(locals._t) > locals.leaderVotes
+                || (locals.poll.optionVotes.get(locals._t) == locals.leaderVotes && locals.leaderVotes > 0 && locals._t == locals.poll.castOption))
+            {
+                locals.leader = locals._t;
+                locals.leaderVotes = locals.poll.optionVotes.get(locals._t);
+            }
+        }
+
+        if (locals.leader >= 0 && locals.leader != locals.poll.castOption)
+        {
+            locals.voteData.proposalIndex = locals.poll.pollIndex;
+            locals.voteData.proposalType = locals.poll.pollType;
+            locals.voteData.proposalTick = locals.poll.pollTick;
+            for (locals._t = 0; locals._t < QVAULT_POLL_MAX_OPTIONS; locals._t++)
+            {
+                locals.voteData.voteValues.set(locals._t, 0);
+                locals.voteData.voteCounts.set(locals._t, 0);
+            }
+            locals.voteData.voteValues.set(0, locals.leader); // voteCounts[0] == 0: all of QVAULT's votes
+            if (qpi.setShareholderVotes((uint16)locals.poll.contractIndex, locals.voteData, 0))
+            {
+                locals.poll.castOption = (sint8)locals.leader;
+            }
+        }
+
+        state.mut().PollP.set(input.proposalId, locals.poll);
+        output.castOption = locals.poll.castOption;
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
      * Local variables for voteInProposal function
      */
     struct voteInProposal_locals
@@ -2749,6 +3122,45 @@ public:
     }
 
     /**
+     * Input structure for getPollP function
+     * @param proposalId ID of the poll proposal to retrieve
+     */
+    struct getPollP_input
+    {
+        uint32 proposalId;
+    };
+
+    /**
+     * Output structure for getPollP function
+     * @param numberOfPollP Number of poll proposals so far
+     * @param proposal Poll proposal information
+     */
+    struct getPollP_output
+    {
+        sint32 returnCode;                 // Status code indicating success or failure
+        uint32 numberOfPollP;
+        PollPInfo proposal;
+    };
+
+    /**
+     * Retrieves information about a specific Poll Proposal (PollP)
+     *
+     * @param input Proposal ID to query
+     * @param output Number of poll proposals and the requested proposal
+     */
+    PUBLIC_FUNCTION(getPollP)
+    {
+        output.numberOfPollP = state.get().numberOfPollP;
+        if (input.proposalId >= state.get().numberOfPollP)
+        {
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+        output.proposal = state.get().PollP.get(input.proposalId);
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
      * Input structure for getIdentitiesHvVtPw function
      * @param offset Starting index for pagination
      * @param count Number of identities to retrieve (max 256)
@@ -3237,7 +3649,7 @@ public:
     /**
      * Input structure for getVoteInProposal function
      * @param userID user identity
-     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP, 8=TreasuryP)
+     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP, 8=TreasuryP, 9=PollP; for PollP votingDecision is the option)
      * @param proposalId ID of the proposal
      */
     struct getVoteInProposal_input
@@ -3281,7 +3693,7 @@ public:
      */
     PUBLIC_FUNCTION_WITH_LOCALS(getVoteInProposal)
     {
-        if (input.proposalType > QVAULT_PROPOSAL_TYPE_TREASURY || input.proposalType < 1)
+        if (input.proposalType > QVAULT_PROPOSAL_TYPE_POLL || input.proposalType < 1)
         {
             output.returnCode = QVAULT_INPUT_ERROR;
             return ;
@@ -3345,6 +3757,13 @@ public:
                     return ;
                 }
                 break;
+            case QVAULT_PROPOSAL_TYPE_POLL:
+                if (input.proposalId >= state.get().numberOfPollP)
+                {
+                    output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+                    return ;
+                }
+                break;
         }
 
         if (state.get().countOfVote.get(input.userID, locals.countOfVote))
@@ -3355,7 +3774,8 @@ public:
                 if (locals.voteList.get(locals._r).proposalId == input.proposalId && locals.voteList.get(locals._r).proposalType == input.proposalType)
                 {
                     output.voteStatus++;
-                    output.votingDecision = locals.voteList.get(locals._r).decision;
+                    // for poll proposals the decision is the chosen option
+                    output.votingDecision = input.proposalType == QVAULT_PROPOSAL_TYPE_POLL ? (sint64)locals.voteList.get(locals._r).priceOfIPO : (sint64)locals.voteList.get(locals._r).decision;
                 }
             }
         }
@@ -3414,6 +3834,7 @@ public:
         REGISTER_USER_FUNCTION(getVoteInProposal, 21);
         REGISTER_USER_FUNCTION(getStakeEpochFlag, 22);
         REGISTER_USER_FUNCTION(getTreasuryP, 23);
+        REGISTER_USER_FUNCTION(getPollP, 24);
 
         REGISTER_USER_PROCEDURE(stake, 1);
         REGISTER_USER_PROCEDURE(unStake, 2);
@@ -3428,6 +3849,8 @@ public:
         REGISTER_USER_PROCEDURE(buyQcap, 12);
         REGISTER_USER_PROCEDURE(TransferShareManagementRights, 13);
         REGISTER_USER_PROCEDURE(submitTreasuryP, 14);
+        REGISTER_USER_PROCEDURE(submitPollP, 15);
+        REGISTER_USER_PROCEDURE(voteInPollP, 16);
     }
 
     INITIALIZE()
@@ -3620,6 +4043,7 @@ public:
         MKTPInfo updatedMKTProposal;                // Updated marketplace proposal
         AlloPInfo updatedAlloProposal;              // Updated allocation proposal
         TreasuryPInfo updatedTreasuryProposal;      // Updated treasury proposal
+        PollPInfo updatedPollProposal;              // Updated poll proposal
         QX::Fees_input qxFees_input;                // Input for QX fees query
         QX::Fees_output qxFees_output;              // QX fees (transfer fee paid for SEND_ASSET)
         QX::TransferShareOwnershipAndPossession_input qxTransfer_input;     // Input for QX share transfer
@@ -4194,6 +4618,23 @@ public:
                 locals.updatedTreasuryProposal.result = locals.treasuryExecuted ? QVAULT_PROPOSAL_PASSED : QVAULT_PROPOSAL_EXECUTION_FAILED;
             }
             state.mut().TreasuryP.set(locals._t, locals.updatedTreasuryProposal);
+        }
+
+        /*
+            Poll Proposal Result
+            QVAULT's shares were already cast during the epoch (the poll's contract closes its poll before
+            QVAULT's END_EPOCH runs, because END_EPOCH runs from the highest contract index down). Only record the outcome.
+        */
+
+        for (locals._t = state.get().numberOfPollP - 1; locals._t >= 0; locals._t--)
+        {
+            if (state.get().PollP.get(locals._t).proposedEpoch != qpi.epoch())
+            {
+                break;
+            }
+            locals.updatedPollProposal = state.get().PollP.get(locals._t);
+            locals.updatedPollProposal.result = locals.updatedPollProposal.castOption >= 0 ? QVAULT_POLL_VOTED : QVAULT_POLL_NO_VOTES;
+            state.mut().PollP.set(locals._t, locals.updatedPollProposal);
         }
 
         state.mut().totalVotingPower = 0;
