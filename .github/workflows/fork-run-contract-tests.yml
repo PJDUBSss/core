@@ -1,0 +1,36 @@
+# Fork-only workflow (PJDUBSss/core): the upstream BuildTests workflow only compiles the tests.
+# This one also runs the QVAULT and QX contract tests. Not meant for qubic/core.
+name: RunContractTests
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-tests:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v1.0.2
+
+    - name: Restore NuGet packages
+      run: nuget restore . -Verbosity quiet
+
+    - name: Build tests
+      run: msbuild /m /p:Configuration=Release . /t:test:Rebuild
+
+    - name: Run QVAULT and QX tests
+      working-directory: test
+      shell: pwsh
+      run: |
+        $exe = Get-ChildItem -Path .. -Recurse -Filter test.exe | Where-Object { $_.FullName -match 'Release' } | Select-Object -First 1
+        if (-not $exe) { Write-Error "test.exe not found"; exit 1 }
+        Write-Host "Running $($exe.FullName)"
+        & $exe.FullName --gtest_filter="TestContractQvault.*:ContractQx.*"
+        exit $LASTEXITCODE
