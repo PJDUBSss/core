@@ -1320,8 +1320,8 @@ public:
         input.proposalData.type = ProposalTypes::VariableYesNo;
         input.proposalData.data.variableOptions.variable = 2;
         input.proposalData.data.variableOptions.value = 100;
-        TESTEXA::SetShareholderProposal_output output;
-        invokeUserProcedure(TESTEXA_CONTRACT_INDEX, 65534, input, output, proposer, 0);
+        TESTEXA::SetShareholderProposal_output output = INVALID_PROPOSAL_INDEX;
+        EXPECT_TRUE(invokeUserProcedure(TESTEXA_CONTRACT_INDEX, 65534, input, output, proposer, 0));
         return output;
     }
 
@@ -1378,6 +1378,7 @@ TEST(TestContractQvault, pollProposalCastsSharesLive)
 
     // QVAULT owns 100 of the 676 TESTEXA shares; a shareholder opens a yes/no poll
     const id shareholder = getUser(10);
+    increaseEnergy(shareholder, 1000000);
     std::vector<std::pair<m256i, unsigned int>> shares{ { shareholder, 576 }, { QVAULT_CONTRACT_ID, 100 } };
     issueContractShares(TESTEXA_CONTRACT_INDEX, shares);
     const uint64 testExAName = assetNameFromString("TESTEXA");
