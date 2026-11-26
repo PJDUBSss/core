@@ -2119,7 +2119,6 @@ public:
         }
         state.mut().proposalCreateFund += QVAULT_PROPOSAL_FEE;
 
-        locals.newProposal.currentQuorumPercent = state.get().quorumPercent;
         locals.newProposal.currentTotalVotingPower = state.get().totalVotingPower;
         for (locals._t = 0; locals._t < QVAULT_MAX_URLS_COUNT; locals._t++)
         {
