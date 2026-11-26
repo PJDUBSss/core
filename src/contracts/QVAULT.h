@@ -24,6 +24,9 @@ constexpr uint32 QVAULT_UNSTAKE_FEE = 100000; // Fee required to unstake qcap
 // One-shot move of QCAP staked by frozen identities (see frozen_addresses.h) to FROZEN_ESCROW, run in BEGIN_EPOCH of this epoch
 constexpr uint16 QVAULT_FROZEN_STAKE_ESCROW_EPOCH = 243;
 constexpr uint32 QVAULT_LOG_FROZEN_STAKE_ESCROWED = 1; // Log type: staked QCAP of a frozen identity moved to FROZEN_ESCROW
+// Proposals submitted from this epoch on take effect as soon as the next epoch begins (QCP, AlloP, FundP sale).
+// Proposals submitted earlier keep the old timing of one extra epoch, so nothing already scheduled is skipped.
+constexpr uint32 QVAULT_FAST_PROPOSAL_EFFECT_EPOCH = 243;
 
 // Yearly QCAP sale limits
 constexpr uint32 QVAULT_2025MAX_QCAP_SALE_AMOUNT = 10714286; // Maximum QCAP sales for 2025
@@ -632,6 +635,15 @@ public:
          res = ((_year - 24) << 26) | (_month << 22) | (_day << 17) | (_hour << 12) | (_minute << 6) | (_second);
      }
  
+     /**
+     * @return first epoch in which a passed QCP, AlloP or FundP takes effect
+     * Voting ends when the proposal's epoch ends; from QVAULT_FAST_PROPOSAL_EFFECT_EPOCH on the result applies in the very next epoch
+     */
+     inline static uint32 qvaultProposalEffectEpoch(uint32 proposedEpoch)
+     {
+         return proposedEpoch >= QVAULT_FAST_PROPOSAL_EFFECT_EPOCH ? proposedEpoch + 1 : proposedEpoch + 2;
+     }
+
      inline static uint32 qvaultGetYear(uint32 data)
      {
          return ((data >> 26) + 24);
@@ -722,7 +734,7 @@ public:
         output.circulatingSupply = (uint32)(qpi.numberOfShares(locals.qcapAsset) - qpi.numberOfShares(locals.qcapAsset, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) + state.get().totalStakedQcapAmount);
         for (locals._t = state.get().numberOfFundP - 1; locals._t >= 0; locals._t--)
         {
-            if (state.get().FundP.get(locals._t).result == 0 && state.get().FundP.get(locals._t).proposedEpoch + 1 < qpi.epoch())
+            if (state.get().FundP.get(locals._t).result == 0 && qvaultProposalEffectEpoch(state.get().FundP.get(locals._t).proposedEpoch) <= qpi.epoch())
             {
                 output.qcapMarketCap = output.circulatingSupply * state.get().FundP.get(locals._t).pricePerOneQcap;
                 break;
@@ -2088,7 +2100,7 @@ public:
 
         for (locals._t = state.get().numberOfFundP - 1; locals._t >= 0; locals._t--)
         {
-            if (state.get().FundP.get(locals._t).result == 0 && state.get().FundP.get(locals._t).proposedEpoch + 1 < qpi.epoch() && state.get().FundP.get(locals._t).restSaleAmount >= input.amount)
+            if (state.get().FundP.get(locals._t).result == 0 && qvaultProposalEffectEpoch(state.get().FundP.get(locals._t).proposedEpoch) <= qpi.epoch() && state.get().FundP.get(locals._t).restSaleAmount >= input.amount)
             {
                 if (qpi.invocationReward() >= (sint64)state.get().FundP.get(locals._t).pricePerOneQcap * input.amount)
                 {
@@ -3274,7 +3286,7 @@ public:
 
         for (locals._t = state.get().numberOfQCP - 1 ; locals._t >= 0; locals._t--)
         {
-            if (state.get().QCP.get(locals._t).result == 0 && state.get().QCP.get(locals._t).proposedEpoch + 2 == qpi.epoch())
+            if (state.get().QCP.get(locals._t).result == 0 && qvaultProposalEffectEpoch(state.get().QCP.get(locals._t).proposedEpoch) == qpi.epoch())
             {
                 state.mut().quorumPercent = state.get().QCP.get(locals._t).newQuorumPercent;
                 break;
@@ -3287,7 +3299,7 @@ public:
 
         for (locals._t = state.get().numberOfAlloP - 1; locals._t >= 0; locals._t--)
         {
-            if (state.get().AlloP.get(locals._t).result == 0 && state.get().AlloP.get(locals._t).proposedEpoch + 2 == qpi.epoch())
+            if (state.get().AlloP.get(locals._t).result == 0 && qvaultProposalEffectEpoch(state.get().AlloP.get(locals._t).proposedEpoch) == qpi.epoch())
             {
                 state.mut().QCAPHolderPermille = state.get().AlloP.get(locals._t).distributed;
                 state.mut().reinvestingPermille = state.get().AlloP.get(locals._t).reinvested;

@@ -1029,3 +1029,88 @@ TEST(TestContractQvault, frozenStakeMovedToEscrowOnce)
     EXPECT_EQ(state->numberOfStaker, 0);
     EXPECT_EQ(state->totalStakedQcapAmount, 0);
 }
+
+TEST(TestContractQvault, passedProposalsTakeEffectNextEpoch)
+{
+    const uint32 cutover = QVAULT_FAST_PROPOSAL_EFFECT_EPOCH;
+    system.epoch = cutover - 2;
+    ContractTestingQvault qvault;
+    QVAULTChecker* state = qvault.getState();
+
+    // quorum change proposed before the cutover keeps the old timing (two epochs later)
+    QVAULT::QCPInfo qcp;
+    setMemory(qcp, 0);
+    qcp.proposedEpoch = cutover - 2;
+    qcp.newQuorumPercent = 400;
+    qcp.result = QVAULT_PROPOSAL_PASSED;
+    state->QCP.set(0, qcp);
+    state->numberOfQCP = 1;
+    const uint32 initialQuorum = state->quorumPercent;
+    ASSERT_NE(initialQuorum, 400u);
+
+    system.epoch = cutover - 1;
+    qvault.beginEpoch();
+    EXPECT_EQ(state->quorumPercent, initialQuorum);
+    system.epoch = cutover;
+    qvault.beginEpoch();
+    EXPECT_EQ(state->quorumPercent, 400u);
+
+    // quorum change and allocation proposed in the cutover epoch apply as soon as the next epoch begins
+    qcp.proposedEpoch = cutover;
+    qcp.newQuorumPercent = 500;
+    state->QCP.set(1, qcp);
+    state->numberOfQCP = 2;
+
+    QVAULT::AlloPInfo allo;
+    setMemory(allo, 0);
+    allo.proposedEpoch = cutover;
+    allo.distributed = 950;
+    allo.reinvested = 20;
+    allo.burnQcap = 0;
+    allo.result = QVAULT_PROPOSAL_PASSED;
+    state->AlloP.set(0, allo);
+    state->numberOfAlloP = 1;
+    const uint32 initialDistributed = state->QCAPHolderPermille;
+    ASSERT_NE(initialDistributed, 950u);
+
+    // QCAP sale proposed in the cutover epoch opens in the next epoch
+    uint64 qcapAssetName = assetNameFromString("QCAP");
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_ISSUE_ASSET_FEE);
+    EXPECT_EQ(qvault.issueAsset(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, 0, 0), QVAULT_QCAP_MAX_SUPPLY);
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID), QVAULT_QCAP_MAX_SUPPLY);
+
+    QVAULT::FundPInfo fund;
+    setMemory(fund, 0);
+    fund.proposedEpoch = cutover;
+    fund.pricePerOneQcap = 100000;
+    fund.amountOfQcap = 1000;
+    fund.restSaleAmount = 1000;
+    fund.result = QVAULT_PROPOSAL_PASSED;
+    state->FundP.set(0, fund);
+    state->numberOfFundP = 1;
+
+    setMemory(utcTime, 0);
+    utcTime.Year = 2026;
+    utcTime.Month = 12;
+    utcTime.Day = 1;
+    updateQpiTime();
+
+    const id buyer = getUser(7);
+    const uint32 buyAmount = 100;
+    const uint64 payment = fund.pricePerOneQcap * buyAmount;
+    increaseEnergy(buyer, payment);
+    EXPECT_EQ(qvault.buyQcap(buyer, buyAmount, payment), QVAULT_FAILED);   // still the voting epoch
+    EXPECT_EQ(getBalance(buyer), payment);                                  // payment refunded
+
+    system.epoch = cutover + 1;
+    qvault.beginEpoch();
+    EXPECT_EQ(state->quorumPercent, 500u);
+    EXPECT_EQ(state->QCAPHolderPermille, 950u);
+    EXPECT_EQ(state->reinvestingPermille, 20u);
+    EXPECT_EQ(state->qcapBurnPermille, 0u);
+
+    EXPECT_EQ(qvault.buyQcap(buyer, buyAmount, payment), QVAULT_SUCCESS);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, buyer, buyer, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), buyAmount);
+    EXPECT_EQ(state->FundP.get(0).restSaleAmount, 1000u - buyAmount);
+}
