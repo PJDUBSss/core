@@ -1193,7 +1193,9 @@ TEST(TestContractQvault, treasuryProposals)
     EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SELL_ASSET, NULL_ID, QVAULT_QCAP_ISSUER, qcapAssetName, 0, 100, 1000), QVAULT_INPUT_ERROR); // QCAP sales go through FundP
     EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_QU, NULL_ID, NULL_ID, 0, 1000, 0, 0), QVAULT_INPUT_ERROR);                        // no destination
     EXPECT_EQ(qvault.submitTreasuryP(staker, 9, destination, NULL_ID, 0, 1000, 0, 0), QVAULT_INPUT_ERROR);                                         // unknown action
+    increaseEnergy(getUser(4), QVAULT_PROPOSAL_FEE);
     EXPECT_EQ(qvault.submitTreasuryP(getUser(4), QVAULT_TREASURY_SEND_QU, destination, NULL_ID, 0, 1000, 0, 0), QVAULT_NO_VOTING_POWER);            // not a staker
+    EXPECT_EQ(getBalance(getUser(4)), QVAULT_PROPOSAL_FEE);                                                                                         // fee refunded
     EXPECT_EQ(qvault.getTreasuryP(0).numberOfTreasuryP, 0u);
 
     EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_QU, destination, NULL_ID, 0, 1000000000ull, 0, 0), QVAULT_SUCCESS);           // 0: release 1B Qu
