@@ -27,6 +27,12 @@ constexpr uint32 QVAULT_LOG_FROZEN_STAKE_ESCROWED = 1; // Log type: staked QCAP 
 // Proposals submitted from this epoch on take effect as soon as the next epoch begins (QCP, AlloP, FundP sale).
 // Proposals submitted earlier keep the old timing of one extra epoch, so nothing already scheduled is skipped.
 constexpr uint32 QVAULT_FAST_PROPOSAL_EFFECT_EPOCH = 243;
+// Treasury proposals (TreasuryP): release Qu from the reinvesting fund, send assets QVAULT holds, or sell assets on QX
+constexpr uint32 QVAULT_MAX_NUMBER_OF_TREASURY_PROPOSAL = 4096; // Maximum number of treasury proposals
+constexpr uint32 QVAULT_PROPOSAL_TYPE_TREASURY = 8;             // proposalType of TreasuryP in voteInProposal / getVoteInProposal
+constexpr uint8 QVAULT_TREASURY_SEND_QU = 1;                    // Send Qu from the reinvesting fund to the destination
+constexpr uint8 QVAULT_TREASURY_SEND_ASSET = 2;                 // Send QX-managed shares QVAULT owns (QCAP included) to the destination
+constexpr uint8 QVAULT_TREASURY_SELL_ASSET = 3;                 // Place a QX ask order for QX-managed shares QVAULT owns (not QCAP)
 
 // Yearly QCAP sale limits
 constexpr uint32 QVAULT_2025MAX_QCAP_SALE_AMOUNT = 10714286; // Maximum QCAP sales for 2025
@@ -67,6 +73,7 @@ constexpr uint8 QVAULT_PROPOSAL_INSUFFICIENT_QUORUM = 2;
 constexpr uint8 QVAULT_PROPOSAL_INSUFFICIENT_VOTING_POWER = 3;
 constexpr uint8 QVAULT_PROPOSAL_INSUFFICIENT_QCAP = 4;
 constexpr uint8 QVAULT_PROPOSAL_NOT_STARTED = 5;
+constexpr uint8 QVAULT_PROPOSAL_EXECUTION_FAILED = 6;   // Passed, but could not be carried out (not enough funds or shares, or over the QCAP sale limit)
 
 /**
  * QVAULT2 - Placeholder struct for future use
@@ -230,6 +237,29 @@ struct QVAULT : public ContractBase
         uint8 result;                   // Proposal result: 0=passed, 1=rejected, 2=insufficient quorum
     };
     /**
+    * Treasury Proposal (TreasuryP) information structure
+    * Releases Qu from the reinvesting fund, sends assets QVAULT holds, or sells assets on QX
+    */
+    struct TreasuryPInfo
+    {
+        id proposer;                    // Address of the proposal creator
+        id destination;                 // Receiver of Qu or shares (SEND_QU, SEND_ASSET)
+        id assetIssuer;                 // Issuer of the asset (SEND_ASSET, SELL_ASSET)
+        uint64 assetName;               // Name of the asset (SEND_ASSET, SELL_ASSET)
+        uint64 amountOfQubic;           // Qu to release from the reinvesting fund (SEND_QU)
+        sint64 numberOfShares;          // Number of shares to send or sell (SEND_ASSET, SELL_ASSET)
+        sint64 pricePerShare;           // Ask price per share in Qu (SELL_ASSET)
+        uint32 currentTotalVotingPower; // Total voting power when proposal was created
+        uint32 numberOfYes;             // Number of yes votes received
+        uint32 numberOfNo;              // Number of no votes received
+        uint32 proposedEpoch;           // Epoch when proposal was created
+        uint32 currentQuorumPercent;    // Quorum percentage when proposal was created
+        Array<uint8, QVAULT_MAX_URLS_COUNT> url;          // URL containing proposal details
+        uint8 action;                   // QVAULT_TREASURY_SEND_QU, QVAULT_TREASURY_SEND_ASSET or QVAULT_TREASURY_SELL_ASSET
+        uint8 result;                   // Proposal result: 0=passed and executed, 1=rejected, 2=insufficient quorum, 5=not started, 6=execution failed
+    };
+
+    /**
     * Vote status information structure
     * Tracks individual user votes on proposals
     */
@@ -314,6 +344,10 @@ struct QVAULT : public ContractBase
         uint32 quorumPercent;               // Current quorum percentage for proposals 
 
         HashMap<id, uint8, 16384> userEpochActionsFlags;
+
+        // Appended in v2.1 (state extended with PADDING, existing variables unchanged)
+        Array<TreasuryPInfo, QVAULT_MAX_NUMBER_OF_TREASURY_PROPOSAL> TreasuryP; // Storage array for treasury proposals
+        uint32 numberOfTreasuryP;           // Number of Treasury Proposals
     };
 public:
 
@@ -562,9 +596,41 @@ public:
     };
 
     /**
+     * Input structure for submitTreasuryP (Treasury Proposal) function
+     * @param destination Receiver of Qu or shares (SEND_QU, SEND_ASSET)
+     * @param assetIssuer Issuer of the asset (SEND_ASSET, SELL_ASSET)
+     * @param assetName Name of the asset (SEND_ASSET, SELL_ASSET)
+     * @param amountOfQubic Qu to release from the reinvesting fund (SEND_QU)
+     * @param numberOfShares Number of shares to send or sell (SEND_ASSET, SELL_ASSET)
+     * @param pricePerShare Ask price per share in Qu (SELL_ASSET)
+     * @param action QVAULT_TREASURY_SEND_QU, QVAULT_TREASURY_SEND_ASSET or QVAULT_TREASURY_SELL_ASSET
+     * @param url URL containing proposal details (max 256 bytes)
+     */
+    struct submitTreasuryP_input
+    {
+        id destination;
+        id assetIssuer;
+        uint64 assetName;
+        uint64 amountOfQubic;
+        sint64 numberOfShares;
+        sint64 pricePerShare;
+        uint8 action;
+        Array<uint8, QVAULT_MAX_URLS_COUNT> url;
+    };
+
+    /**
+     * Output structure for submitTreasuryP function
+     * @param returnCode Status code indicating success or failure
+     */
+    struct submitTreasuryP_output
+    {
+        sint32 returnCode;
+    };
+
+    /**
      * Input structure for voteInProposal function
      * @param priceOfIPO IPO price for IPO participation proposals
-     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP)
+     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP, 8=TreasuryP)
      * @param proposalId ID of the proposal to vote on
      * @param yes Voting decision (1=yes, 0=no)
      */
@@ -1725,6 +1791,130 @@ public:
     }
 
     /**
+     * Local variables for submitTreasuryP function
+     */
+    struct submitTreasuryP_locals
+    {
+        Asset qvaultShare;              // QVAULT share asset information
+        TreasuryPInfo newProposal;      // New treasury proposal to create
+        sint32 _t;                      // Loop counter variable
+    };
+
+    /**
+     * Submits a Treasury Proposal (TreasuryP)
+     * SEND_QU releases Qu from the reinvesting fund, SEND_ASSET sends QX-managed shares owned by QVAULT
+     * (QCAP included, counted against the yearly QCAP sale limits), SELL_ASSET places a QX ask order for
+     * QX-managed shares owned by QVAULT (QCAP excluded, use FundP for QCAP sales).
+     * Staked QCAP is managed by QVAULT, not QX, so it can never be released.
+     * Requires minimum voting power (10000) or QVAULT shares, and the proposal fee.
+     * A passed proposal is carried out at the end of the epoch it was voted in.
+     *
+     * @param input Action, destination, amounts, asset and URL containing proposal details
+     * @param output Status code indicating success or failure
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(submitTreasuryP)
+    {
+        locals.qvaultShare.assetName = QVAULT_QVAULT_ASSETNAME;
+        locals.qvaultShare.issuer = NULL_ID;
+
+        for (locals._t = 0 ; locals._t < (sint64)state.get().numberOfVotingPower; locals._t++)
+        {
+            if (state.get().votingPower.get(locals._t).stakerAddress == qpi.invocator())
+            {
+                if (state.get().votingPower.get(locals._t).amount >= QVAULT_MIN_VOTING_POWER)
+                {
+                    break;
+                }
+                else
+                {
+                    if (qpi.numberOfShares(locals.qvaultShare, AssetOwnershipSelect::byOwner(qpi.invocator()), AssetPossessionSelect::byPossessor(qpi.invocator())) <= 0)
+                    {
+                        output.returnCode = QVAULT_INSUFFICIENT_VOTING_POWER;
+                        if (qpi.invocationReward() > 0)
+                        {
+                            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                        }
+                        return ;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (locals._t == state.get().numberOfVotingPower && qpi.numberOfShares(locals.qvaultShare, AssetOwnershipSelect::byOwner(qpi.invocator()), AssetPossessionSelect::byPossessor(qpi.invocator())) <= 0)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_NO_VOTING_POWER;
+            return ;
+        }
+
+        if ((input.action == QVAULT_TREASURY_SEND_QU && (input.amountOfQubic == 0 || input.destination == NULL_ID))
+            || (input.action == QVAULT_TREASURY_SEND_ASSET && (input.numberOfShares <= 0 || input.assetName == 0 || input.destination == NULL_ID || input.destination == SELF))
+            || (input.action == QVAULT_TREASURY_SELL_ASSET && (input.numberOfShares <= 0 || input.assetName == 0 || input.pricePerShare <= 0
+                || (input.assetName == QVAULT_QCAP_ASSETNAME && input.assetIssuer == state.get().QCAP_ISSUER)))
+            || input.action < QVAULT_TREASURY_SEND_QU || input.action > QVAULT_TREASURY_SELL_ASSET)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+
+        if (qpi.invocationReward() < QVAULT_PROPOSAL_FEE)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INSUFFICIENT_FUND;
+            return ;
+        }
+        if (state.get().numberOfTreasuryP >= QVAULT_MAX_NUMBER_OF_TREASURY_PROPOSAL)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+            return ;
+        }
+        if (qpi.invocationReward() > QVAULT_PROPOSAL_FEE)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward() - QVAULT_PROPOSAL_FEE);
+        }
+        state.mut().proposalCreateFund += QVAULT_PROPOSAL_FEE;
+
+        locals.newProposal.currentQuorumPercent = state.get().quorumPercent;
+        locals.newProposal.currentTotalVotingPower = state.get().totalVotingPower;
+        for (locals._t = 0; locals._t < QVAULT_MAX_URLS_COUNT; locals._t++)
+        {
+            locals.newProposal.url.set(locals._t, input.url.get(locals._t));
+        }
+        locals.newProposal.proposedEpoch = qpi.epoch();
+        locals.newProposal.numberOfYes = 0;
+        locals.newProposal.numberOfNo = 0;
+        locals.newProposal.proposer = qpi.invocator();
+        locals.newProposal.result = QVAULT_PROPOSAL_NOT_STARTED;
+
+        locals.newProposal.action = input.action;
+        locals.newProposal.destination = input.destination;
+        locals.newProposal.assetIssuer = input.assetIssuer;
+        locals.newProposal.assetName = input.assetName;
+        locals.newProposal.amountOfQubic = input.amountOfQubic;
+        locals.newProposal.numberOfShares = input.numberOfShares;
+        locals.newProposal.pricePerShare = input.pricePerShare;
+
+        state.mut().TreasuryP.set(state.get().numberOfTreasuryP, locals.newProposal);
+        state.mut().numberOfTreasuryP++;
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
      * Local variables for voteInProposal function
      */
     struct voteInProposal_locals
@@ -1736,6 +1926,7 @@ public:
         FundPInfo updatedFundProposal;              // Updated fundraising proposal
         MKTPInfo updatedMKTProposal;                // Updated marketplace proposal
         AlloPInfo updatedAlloProposal;              // Updated allocation proposal
+        TreasuryPInfo updatedTreasuryProposal;      // Updated treasury proposal
         Array<voteStatusInfo, QVAULT_MAX_USER_VOTES> newVoteList;      // Updated vote list for user
         voteStatusInfo newVote;                     // New vote to add
         sint32 numberOfYes;                         // Number of yes votes to add
@@ -1756,7 +1947,7 @@ public:
      */
     PUBLIC_PROCEDURE_WITH_LOCALS(voteInProposal)
     {
-        if (input.proposalType > 7 || input.proposalType < 1)
+        if (input.proposalType > QVAULT_PROPOSAL_TYPE_TREASURY || input.proposalType < 1)
         {
             output.returnCode = QVAULT_INPUT_ERROR;
             return ;
@@ -1812,6 +2003,13 @@ public:
                 break;
             case 7:
                 if (input.proposalId >= state.get().numberOfAlloP)
+                {
+                    output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+                    return ;
+                }
+                break;
+            case QVAULT_PROPOSAL_TYPE_TREASURY:
+                if (input.proposalId >= state.get().numberOfTreasuryP)
                 {
                     output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
                     return ;
@@ -1880,6 +2078,10 @@ public:
             case 7:
                 locals.updatedAlloProposal = state.get().AlloP.get(input.proposalId);
                 locals.statusOfProposal = state.get().AlloP.get(input.proposalId).proposedEpoch == qpi.epoch() ? 1 : 0;
+                break;
+            case QVAULT_PROPOSAL_TYPE_TREASURY:
+                locals.updatedTreasuryProposal = state.get().TreasuryP.get(input.proposalId);
+                locals.statusOfProposal = state.get().TreasuryP.get(input.proposalId).proposedEpoch == qpi.epoch() ? 1 : 0;
                 break;
             default:
                 break;
@@ -1961,6 +2163,11 @@ public:
                             locals.updatedAlloProposal.numberOfYes += locals.numberOfYes;
                             locals.updatedAlloProposal.numberOfNo += locals.numberOfNo;
                             state.mut().AlloP.set(input.proposalId, locals.updatedAlloProposal);
+                            break;
+                        case QVAULT_PROPOSAL_TYPE_TREASURY:
+                            locals.updatedTreasuryProposal.numberOfYes += locals.numberOfYes;
+                            locals.updatedTreasuryProposal.numberOfNo += locals.numberOfNo;
+                            state.mut().TreasuryP.set(input.proposalId, locals.updatedTreasuryProposal);
                             break;
                         default:
                             break;
@@ -2503,6 +2710,45 @@ public:
     }
 
     /**
+     * Input structure for getTreasuryP function
+     * @param proposalId ID of the treasury proposal to retrieve
+     */
+    struct getTreasuryP_input
+    {
+        uint32 proposalId;
+    };
+
+    /**
+     * Output structure for getTreasuryP function
+     * @param numberOfTreasuryP Number of treasury proposals so far
+     * @param proposal Treasury proposal information
+     */
+    struct getTreasuryP_output
+    {
+        sint32 returnCode;                 // Status code indicating success or failure
+        uint32 numberOfTreasuryP;
+        TreasuryPInfo proposal;
+    };
+
+    /**
+     * Retrieves information about a specific Treasury Proposal (TreasuryP)
+     *
+     * @param input Proposal ID to query
+     * @param output Number of treasury proposals and the requested proposal
+     */
+    PUBLIC_FUNCTION(getTreasuryP)
+    {
+        output.numberOfTreasuryP = state.get().numberOfTreasuryP;
+        if (input.proposalId >= state.get().numberOfTreasuryP)
+        {
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+        output.proposal = state.get().TreasuryP.get(input.proposalId);
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
      * Input structure for getIdentitiesHvVtPw function
      * @param offset Starting index for pagination
      * @param count Number of identities to retrieve (max 256)
@@ -2991,7 +3237,7 @@ public:
     /**
      * Input structure for getVoteInProposal function
      * @param userID user identity
-     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP)
+     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP, 8=TreasuryP)
      * @param proposalId ID of the proposal
      */
     struct getVoteInProposal_input
@@ -3035,7 +3281,7 @@ public:
      */
     PUBLIC_FUNCTION_WITH_LOCALS(getVoteInProposal)
     {
-        if (input.proposalType > 7 || input.proposalType < 1)
+        if (input.proposalType > QVAULT_PROPOSAL_TYPE_TREASURY || input.proposalType < 1)
         {
             output.returnCode = QVAULT_INPUT_ERROR;
             return ;
@@ -3087,6 +3333,13 @@ public:
                 break;
             case 7:
                 if (input.proposalId >= state.get().numberOfAlloP)
+                {
+                    output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+                    return ;
+                }
+                break;
+            case QVAULT_PROPOSAL_TYPE_TREASURY:
+                if (input.proposalId >= state.get().numberOfTreasuryP)
                 {
                     output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
                     return ;
@@ -3160,6 +3413,7 @@ public:
         REGISTER_USER_FUNCTION(getAmountForQearnInUpcomingEpoch, 20);
         REGISTER_USER_FUNCTION(getVoteInProposal, 21);
         REGISTER_USER_FUNCTION(getStakeEpochFlag, 22);
+        REGISTER_USER_FUNCTION(getTreasuryP, 23);
 
         REGISTER_USER_PROCEDURE(stake, 1);
         REGISTER_USER_PROCEDURE(unStake, 2);
@@ -3173,6 +3427,7 @@ public:
         REGISTER_USER_PROCEDURE(voteInProposal, 11);
         REGISTER_USER_PROCEDURE(buyQcap, 12);
         REGISTER_USER_PROCEDURE(TransferShareManagementRights, 13);
+        REGISTER_USER_PROCEDURE(submitTreasuryP, 14);
     }
 
     INITIALIZE()
@@ -3364,6 +3619,16 @@ public:
         FundPInfo updatedFundProposal;              // Updated fundraising proposal
         MKTPInfo updatedMKTProposal;                // Updated marketplace proposal
         AlloPInfo updatedAlloProposal;              // Updated allocation proposal
+        TreasuryPInfo updatedTreasuryProposal;      // Updated treasury proposal
+        QX::Fees_input qxFees_input;                // Input for QX fees query
+        QX::Fees_output qxFees_output;              // QX fees (transfer fee paid for SEND_ASSET)
+        QX::TransferShareOwnershipAndPossession_input qxTransfer_input;     // Input for QX share transfer
+        QX::TransferShareOwnershipAndPossession_output qxTransfer_output;   // Output from QX share transfer
+        QX::AddToAskOrder_input qxAsk_input;        // Input for QX ask order
+        QX::AddToAskOrder_output qxAsk_output;      // Output from QX ask order
+        uint32 qcapSaleLimit;                       // QCAP sale limit of the current year
+        sint32 treasuryStart;                       // Index of the first treasury proposal of this epoch
+        bit treasuryExecuted;                       // Whether a passed treasury proposal was carried out
         Entity entity;                               // Entity information
         AssetPossessionIterator iter;                // Iterator for asset possession
         Asset QCAPId;                                // QCAP asset identifier
@@ -3834,6 +4099,101 @@ public:
             {
                 break;
             }
+        }
+
+        /*
+            Treasury Proposal Result
+            Passed proposals are carried out right away, oldest first. Runs after IPO, QEarn and MKTP
+            so funds they committed this epoch are already taken out of the reinvesting fund.
+        */
+
+        locals.treasuryStart = state.get().numberOfTreasuryP;
+        while (locals.treasuryStart > 0 && state.get().TreasuryP.get(locals.treasuryStart - 1).proposedEpoch == qpi.epoch())
+        {
+            locals.treasuryStart--;
+        }
+
+        packQvaultDate(qpi.year(), qpi.month(), qpi.day(), qpi.hour(), qpi.minute(), qpi.second(), locals.curDate);
+        unpackQvaultDate(locals.year, locals.month, locals.day, locals.hour, locals.minute, locals.second, locals.curDate);
+        locals.qcapSaleLimit = QVAULT_QCAP_MAX_SUPPLY;
+        if (locals.year == 25)
+        {
+            locals.qcapSaleLimit = QVAULT_2025MAX_QCAP_SALE_AMOUNT;
+        }
+        else if (locals.year == 26)
+        {
+            locals.qcapSaleLimit = QVAULT_2026MAX_QCAP_SALE_AMOUNT;
+        }
+        else if (locals.year == 27)
+        {
+            locals.qcapSaleLimit = QVAULT_2027MAX_QCAP_SALE_AMOUNT;
+        }
+
+        for (locals._t = locals.treasuryStart; locals._t < (sint32)state.get().numberOfTreasuryP; locals._t++)
+        {
+            locals.updatedTreasuryProposal = state.get().TreasuryP.get(locals._t);
+            if (locals.updatedTreasuryProposal.numberOfYes + locals.updatedTreasuryProposal.numberOfNo < div(locals.updatedTreasuryProposal.currentQuorumPercent * locals.updatedTreasuryProposal.currentTotalVotingPower * 1ULL, 1000ULL))
+            {
+                locals.updatedTreasuryProposal.result = QVAULT_PROPOSAL_INSUFFICIENT_QUORUM;
+            }
+            else if (locals.updatedTreasuryProposal.numberOfYes <= locals.updatedTreasuryProposal.numberOfNo)
+            {
+                locals.updatedTreasuryProposal.result = QVAULT_PROPOSAL_REJECTED;
+            }
+            else
+            {
+                locals.treasuryExecuted = 0;
+                if (locals.updatedTreasuryProposal.action == QVAULT_TREASURY_SEND_QU)
+                {
+                    if (locals.updatedTreasuryProposal.amountOfQubic <= state.get().reinvestingFund
+                        && qpi.transfer(locals.updatedTreasuryProposal.destination, locals.updatedTreasuryProposal.amountOfQubic) >= 0)
+                    {
+                        state.mut().reinvestingFund -= locals.updatedTreasuryProposal.amountOfQubic;
+                        locals.treasuryExecuted = 1;
+                    }
+                }
+                else if (locals.updatedTreasuryProposal.action == QVAULT_TREASURY_SEND_ASSET)
+                {
+                    CALL_OTHER_CONTRACT_FUNCTION(QX, Fees, locals.qxFees_input, locals.qxFees_output);
+                    if (locals.qxFees_output.transferFee <= state.get().reinvestingFund
+                        && qpi.numberOfPossessedShares(locals.updatedTreasuryProposal.assetName, locals.updatedTreasuryProposal.assetIssuer, SELF, SELF, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX) >= locals.updatedTreasuryProposal.numberOfShares
+                        && (locals.updatedTreasuryProposal.assetName != QVAULT_QCAP_ASSETNAME || locals.updatedTreasuryProposal.assetIssuer != state.get().QCAP_ISSUER
+                            || state.get().qcapSoldAmount + (uint64)locals.updatedTreasuryProposal.numberOfShares <= locals.qcapSaleLimit))
+                    {
+                        locals.qxTransfer_input.issuer = locals.updatedTreasuryProposal.assetIssuer;
+                        locals.qxTransfer_input.assetName = locals.updatedTreasuryProposal.assetName;
+                        locals.qxTransfer_input.numberOfShares = locals.updatedTreasuryProposal.numberOfShares;
+                        locals.qxTransfer_input.newOwnerAndPossessor = locals.updatedTreasuryProposal.destination;
+                        INVOKE_OTHER_CONTRACT_PROCEDURE(QX, TransferShareOwnershipAndPossession, locals.qxTransfer_input, locals.qxTransfer_output, locals.qxFees_output.transferFee);
+                        state.mut().reinvestingFund -= locals.qxFees_output.transferFee;
+                        if (locals.qxTransfer_output.transferredNumberOfShares == locals.updatedTreasuryProposal.numberOfShares)
+                        {
+                            if (locals.updatedTreasuryProposal.assetName == QVAULT_QCAP_ASSETNAME && locals.updatedTreasuryProposal.assetIssuer == state.get().QCAP_ISSUER)
+                            {
+                                state.mut().qcapSoldAmount += (uint32)locals.updatedTreasuryProposal.numberOfShares;
+                            }
+                            locals.treasuryExecuted = 1;
+                        }
+                    }
+                }
+                else if (locals.updatedTreasuryProposal.action == QVAULT_TREASURY_SELL_ASSET)
+                {
+                    if (qpi.numberOfPossessedShares(locals.updatedTreasuryProposal.assetName, locals.updatedTreasuryProposal.assetIssuer, SELF, SELF, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX) >= locals.updatedTreasuryProposal.numberOfShares)
+                    {
+                        locals.qxAsk_input.issuer = locals.updatedTreasuryProposal.assetIssuer;
+                        locals.qxAsk_input.assetName = locals.updatedTreasuryProposal.assetName;
+                        locals.qxAsk_input.price = locals.updatedTreasuryProposal.pricePerShare;
+                        locals.qxAsk_input.numberOfShares = locals.updatedTreasuryProposal.numberOfShares;
+                        INVOKE_OTHER_CONTRACT_PROCEDURE(QX, AddToAskOrder, locals.qxAsk_input, locals.qxAsk_output, 0);
+                        if (locals.qxAsk_output.addedNumberOfShares == locals.updatedTreasuryProposal.numberOfShares)
+                        {
+                            locals.treasuryExecuted = 1;
+                        }
+                    }
+                }
+                locals.updatedTreasuryProposal.result = locals.treasuryExecuted ? QVAULT_PROPOSAL_PASSED : QVAULT_PROPOSAL_EXECUTION_FAILED;
+            }
+            state.mut().TreasuryP.set(locals._t, locals.updatedTreasuryProposal);
         }
 
         state.mut().totalVotingPower = 0;
