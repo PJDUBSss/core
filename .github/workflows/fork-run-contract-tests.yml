@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch to test
+        required: true
+        default: main
 
 permissions:
   contents: read
@@ -15,6 +20,8 @@ jobs:
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v3
+      with:
+        ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
 
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v1.0.2
