@@ -3222,7 +3222,7 @@ public:
         // this contract and was not covered. Owners recover it from FROZEN_ESCROW like their other frozen assets.
         if (qpi.epoch() == QVAULT_FROZEN_STAKE_ESCROW_EPOCH)
         {
-            locals.frozenEscrow = ID(_X, _M, _G, _U, _N, _W, _J, _Y, _L, _L, _U, _U, _Z, _A, _N, _F, _E, _W, _J, _N, _N, _I, _D, _M, _X, _N, _S, _D, _M, _P, _O, _V, _F, _A, _H, _W, _O, _E, _R, _K, _D, _D, _A, _W, _D, _R, _E, _Z, _L, _A, _N, _H, _T, _F, _J, _B, _K, _M, _P, _B);
+            locals.frozenEscrow = ID(_X, _M, _G, _U, _N, _W, _J, _Y, _L, _L, _U, _U, _Z, _A, _N, _F, _E, _W, _J, _N, _N, _I, _D, _M, _X, _N, _S, _D, _M, _P, _O, _V, _F, _A, _H, _W, _O, _E, _R, _K, _D, _D, _A, _W, _D, _R, _E, _Z, _L, _A, _N, _H, _T, _F, _J, _B);
 
             // remove from staker list; removal moves the last entry into the freed slot, so don't advance after removing
             locals._t = 0;
