@@ -1423,6 +1423,7 @@ TEST(TestContractQvault, pollProposalCastsSharesLive)
     // refused votes
     EXPECT_EQ(qvault.voteInPollP(stakerA, 0, 1).returnCode, QVAULT_SAME_DECISION);
     EXPECT_EQ(qvault.voteInPollP(stakerB, 0, 2).returnCode, QVAULT_INPUT_ERROR);       // only options 0 and 1
+    increaseEnergy(getUser(3), 1000);
     EXPECT_EQ(qvault.voteInPollP(getUser(3), 0, 1).returnCode, QVAULT_NO_VOTING_POWER);
     EXPECT_EQ(qvault.voteInPollP(stakerA, 1, 1).returnCode, QVAULT_OVERFLOW_PROPOSAL);
 
