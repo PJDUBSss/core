@@ -1360,11 +1360,11 @@ TEST(TestContractQvault, pollProposalCastsSharesLive)
     increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_TOKEN_TRANSFER_FEE);
     EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID), QVAULT_QCAP_MAX_SUPPLY);
 
-    // stakers A (6000) and B (4000)
+    // stakers A (12000) and B (8000); creating a proposal needs 10000
     const id stakerA = getUser(1);
     const id stakerB = getUser(2);
     const id stakers[2] = { stakerA, stakerB };
-    const uint32 amounts[2] = { 6000, 4000 };
+    const uint32 amounts[2] = { 12000, 8000 };
     for (int i = 0; i < 2; i++)
     {
         increaseEnergy(QVAULT_CONTRACT_ID, QVAULT_TOKEN_TRANSFER_FEE);
@@ -1408,16 +1408,16 @@ TEST(TestContractQvault, pollProposalCastsSharesLive)
     EXPECT_EQ((int)voted.castOption, 0);
     EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 0), 100u);
     EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 0u);
-    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(0), 6000u);
-    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(1), 4000u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(0), 12000u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(1), 8000u);
 
     // A changes to yes: QVAULT back to yes, A's power moves
     voted = qvault.voteInPollP(stakerA, 0, 1);
     EXPECT_EQ((int)voted.castOption, 1);
     EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 100u);
     EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(0), 0u);
-    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(1), 10000u);
-    EXPECT_EQ(qvault.getPollP(0).proposal.totalVotes, 10000u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(1), 20000u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.totalVotes, 20000u);
     EXPECT_EQ(qvault.getVoteInProposal(stakerA, QVAULT_PROPOSAL_TYPE_POLL, 0).votingDecision, 1);
 
     // refused votes
