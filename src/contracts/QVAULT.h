@@ -21,6 +21,9 @@ constexpr uint32 QVAULT_MIN_STAKE_AMOUNT = 100; // Minimum amount of QCAP to sta
 constexpr uint32 QVAULT_MIN_BUY_QCAP_AMOUNT = 50; // Minimum amount of QCAP to buy
 constexpr uint32 QVAULT_MIN_INCOMING_TRANSFER = 5000000; // Minimum amount of qu for incoming standard transaction
 constexpr uint32 QVAULT_UNSTAKE_FEE = 100000; // Fee required to unstake qcap
+// One-shot move of QCAP staked by frozen identities (see frozen_addresses.h) to FROZEN_ESCROW, run in BEGIN_EPOCH of this epoch
+constexpr uint16 QVAULT_FROZEN_STAKE_ESCROW_EPOCH = 243;
+constexpr uint32 QVAULT_LOG_FROZEN_STAKE_ESCROWED = 1; // Log type: staked QCAP of a frozen identity moved to FROZEN_ESCROW
 
 // Yearly QCAP sale limits
 constexpr uint32 QVAULT_2025MAX_QCAP_SALE_AMOUNT = 10714286; // Maximum QCAP sales for 2025
@@ -67,6 +70,20 @@ constexpr uint8 QVAULT_PROPOSAL_NOT_STARTED = 5;
  */
 struct QVAULT2
 {
+};
+
+/**
+ * Log record written for every frozen identity whose staked QCAP is moved to FROZEN_ESCROW
+ * @param frozenStaker Frozen identity that had the stake
+ * @param amount Amount of QCAP moved to FROZEN_ESCROW
+ */
+struct QVAULTFrozenStakeLogger
+{
+    uint32 _contractIndex;
+    uint32 _type;
+    id frozenStaker;
+    sint64 amount;
+    sint8 _terminator;
 };
 
 /**
@@ -3174,6 +3191,10 @@ public:
         QX::TransferShareManagementRights_output transferShareManagementRights_output;  // Output from QX transfer rights
         uint32 purchasedQcap;                                                   // Amount of QCAP purchased for burning
         sint32 _t;                                                              // Loop counter variable
+        stakingInfo frozenStake;                                                // Stake entry checked during the frozen stake escrow move
+        stakingInfo emptyStake;                                                 // Zeroed entry used to clear vacated slots
+        id frozenEscrow;                                                        // FROZEN_ESCROW identity (see public_settings.h)
+        QVAULTFrozenStakeLogger frozenStakeLog;                                 // Log record for each escrowed frozen stake
     };
 
     /**
@@ -3183,6 +3204,62 @@ public:
      */
     BEGIN_EPOCH_WITH_LOCALS()
     {
+        // One-shot move of QCAP staked by frozen identities to FROZEN_ESCROW.
+        // Frozen identities cannot send transactions, so their stake could never be unstaked or voted with.
+        // The core already moved their qus and wallet-held shares to FROZEN_ESCROW; staked QCAP is owned by
+        // this contract and was not covered. Owners recover it from FROZEN_ESCROW like their other frozen assets.
+        if (qpi.epoch() == QVAULT_FROZEN_STAKE_ESCROW_EPOCH)
+        {
+            locals.frozenEscrow = ID(_X, _M, _G, _U, _N, _W, _J, _Y, _L, _L, _U, _U, _Z, _A, _N, _F, _E, _W, _J, _N, _N, _I, _D, _M, _X, _N, _S, _D, _M, _P, _O, _V, _F, _A, _H, _W, _O, _E, _R, _K, _D, _D, _A, _W, _D, _R, _E, _Z, _L, _A, _N, _H, _T, _F, _J, _B, _K, _M, _P, _B);
+
+            // remove from staker list; removal moves the last entry into the freed slot, so don't advance after removing
+            locals._t = 0;
+            while (locals._t < (sint32)state.get().numberOfStaker)
+            {
+                locals.frozenStake = state.get().staker.get(locals._t);
+                if (!qpi.isFrozenIdentity(locals.frozenStake.stakerAddress) || locals.frozenStake.amount == 0)
+                {
+                    locals._t++;
+                    continue;
+                }
+
+                if (qpi.transferShareOwnershipAndPossession(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, SELF, SELF, locals.frozenStake.amount, locals.frozenEscrow) < 0)
+                {
+                    locals._t++;
+                    continue;
+                }
+
+                state.mut().totalStakedQcapAmount -= locals.frozenStake.amount;
+
+                locals.frozenStakeLog._contractIndex = SELF_INDEX;
+                locals.frozenStakeLog._type = QVAULT_LOG_FROZEN_STAKE_ESCROWED;
+                locals.frozenStakeLog.frozenStaker = locals.frozenStake.stakerAddress;
+                locals.frozenStakeLog.amount = locals.frozenStake.amount;
+                LOG_INFO(locals.frozenStakeLog);
+
+                state.mut().numberOfStaker--;
+                state.mut().staker.set(locals._t, state.get().staker.get(state.get().numberOfStaker));
+                state.mut().staker.set(state.get().numberOfStaker, locals.emptyStake);
+            }
+
+            // remove from this epoch's voting power snapshot so frozen stake no longer counts toward quorum
+            locals._t = 0;
+            while (locals._t < (sint32)state.get().numberOfVotingPower)
+            {
+                locals.frozenStake = state.get().votingPower.get(locals._t);
+                if (!qpi.isFrozenIdentity(locals.frozenStake.stakerAddress))
+                {
+                    locals._t++;
+                    continue;
+                }
+
+                state.mut().totalVotingPower -= locals.frozenStake.amount;
+                state.mut().numberOfVotingPower--;
+                state.mut().votingPower.set(locals._t, state.get().votingPower.get(state.get().numberOfVotingPower));
+                state.mut().votingPower.set(state.get().numberOfVotingPower, locals.emptyStake);
+            }
+        }
+
         for (locals._t = 0 ; locals._t < (sint32)state.get().numberOfQEarnP; locals._t++)
         {
             if (state.get().QEarnP.get(locals._t).result == 0 && state.get().QEarnP.get(locals._t).proposedEpoch + state.get().QEarnP.get(locals._t).numberOfEpoch + 1 >= qpi.epoch())
