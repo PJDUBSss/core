@@ -2,7 +2,7 @@
 
 As of November 27, 2026 · PJDUBSss
 
-All six v2.1 changes, plus auto-unlock of inactive stakers, are written in this fork and pass all 18 QVAULT and QX tests. Five steps remain before the code goes to the Qubic core team.
+All six v2.1 changes, plus auto-unlock of inactive stakers, are written in this fork and pass all 18 QVAULT and QX tests. Six steps remain before the code goes to the Qubic core team.
 
 ## At a glance
 
