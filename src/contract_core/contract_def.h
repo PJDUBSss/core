@@ -612,7 +612,7 @@ struct ContractStateChangeInfo
 // When enabling, replace both lines below, e.g.:
 //constexpr ContractStateChangeInfo contractStateChangeInfos[] = { { DUMMY_CONTRACT_INDEX, MIGRATE, 219 } };
 //constexpr unsigned int contractStateChangeCount = sizeof(contractStateChangeInfos) / sizeof(contractStateChangeInfos[0]);
-constexpr ContractStateChangeInfo contractStateChangeInfos[] = { { QUSINO_CONTRACT_INDEX, RESET, 234} };
+constexpr ContractStateChangeInfo contractStateChangeInfos[] = { { QUSINO_CONTRACT_INDEX, RESET, 234}, { QVAULT_CONTRACT_INDEX, PADDING, 243 } }; // QVAULT: TreasuryP and PollP appended to state (set to release epoch)
 constexpr unsigned int contractStateChangeCount = sizeof(contractStateChangeInfos) / sizeof(contractStateChangeInfos[0]);
 
 

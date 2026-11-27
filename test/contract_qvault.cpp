@@ -670,6 +670,34 @@ public:
         callFunction(QX_CONTRACT_INDEX, 2, input, output);
         return output;
     }
+
+    uint32 submitTreasuryP(const id& address, uint8 action, const id& destination, const id& assetIssuer, uint64 assetName, uint64 amountOfQubic, sint64 numberOfShares, sint64 pricePerShare)
+    {
+        QVAULT::submitTreasuryP_input input;
+        QVAULT::submitTreasuryP_output output;
+        setMemory(input, 0);
+
+        input.action = action;
+        input.destination = destination;
+        input.assetIssuer = assetIssuer;
+        input.assetName = assetName;
+        input.amountOfQubic = amountOfQubic;
+        input.numberOfShares = numberOfShares;
+        input.pricePerShare = pricePerShare;
+
+        invokeUserProcedure(QVAULT_CONTRACT_INDEX, 14, input, output, address, QVAULT_PROPOSAL_FEE);
+
+        return output.returnCode;
+    }
+
+    QVAULT::getTreasuryP_output getTreasuryP(uint32 proposalId) const
+    {
+        QVAULT::getTreasuryP_input input;
+        QVAULT::getTreasuryP_output output;
+        input.proposalId = proposalId;
+        callFunction(QVAULT_CONTRACT_INDEX, 23, input, output);
+        return output;
+    }
 };
 
 
@@ -944,4 +972,467 @@ TEST(TestContractQvault, testingAllProceduresAndFunctions)
     uint64 tmpAmount = numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, stakers[3], stakers[3], QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX);
     QvaultV2.buyQcap(stakers[3], 100, 10000000);
     EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, stakers[3], stakers[3], QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), tmpAmount + 100);
+}
+TEST(TestContractQvault, frozenStakeMovedToEscrowOnce)
+{
+    system.epoch = 138;
+    ContractTestingQvault qvault;
+
+    uint64 qcapAssetName = assetNameFromString("QCAP");
+
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_ISSUE_ASSET_FEE);
+    EXPECT_EQ(qvault.issueAsset(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, 0, 0), QVAULT_QCAP_MAX_SUPPLY);
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID), QVAULT_QCAP_MAX_SUPPLY);
+
+    m256i frozenStaker;
+    getPublicKeyFromIdentity(gFrozenIdentities[0], frozenStaker.m256i_u8);
+    ASSERT_TRUE(isFrozenAddress(frozenStaker));
+    const id normalStaker = getUser(1);
+    ASSERT_FALSE(isFrozenAddress(normalStaker));
+
+    // the escrow id hardcoded in QVAULT must be the core's FROZEN_ESCROW
+    const id escrow = ID(_X, _M, _G, _U, _N, _W, _J, _Y, _L, _L, _U, _U, _Z, _A, _N, _F, _E, _W, _J, _N, _N, _I, _D, _M, _X, _N, _S, _D, _M, _P, _O, _V, _F, _A, _H, _W, _O, _E, _R, _K, _D, _D, _A, _W, _D, _R, _E, _Z, _L, _A, _N, _H, _T, _F, _J, _B);
+    ASSERT_EQ(escrow, frozenEscrowPublicKey);
+
+    const uint32 frozenAmount = 5000;
+    const uint32 normalAmount = 3000;
+    const id users[2] = { frozenStaker, normalStaker };
+    const uint32 amounts[2] = { frozenAmount, normalAmount };
+    for (int i = 0; i < 2; i++)
+    {
+        increaseEnergy(QVAULT_CONTRACT_ID, QVAULT_TOKEN_TRANSFER_FEE);
+        EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, amounts[i], QVAULT_CONTRACT_ID, users[i]), amounts[i]);
+        increaseEnergy(users[i], QVAULT_UNSTAKE_FEE);
+        EXPECT_EQ(qvault.QXTransferShareManagementRights(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_CONTRACT_INDEX, amounts[i], users[i]), amounts[i]);
+        EXPECT_EQ(qvault.stake(users[i], amounts[i]), QVAULT_SUCCESS);
+    }
+
+    // end of epoch copies stakers into the voting power snapshot
+    qvault.endEpoch();
+    EXPECT_EQ(qvault.getState()->numberOfStaker, 2);
+    EXPECT_EQ(qvault.getState()->numberOfVotingPower, 2);
+    EXPECT_EQ(qvault.getState()->totalVotingPower, frozenAmount + normalAmount);
+    EXPECT_EQ(qvault.getState()->totalStakedQcapAmount, frozenAmount + normalAmount);
+
+    // any epoch other than QVAULT_FROZEN_STAKE_ESCROW_EPOCH: nothing moves
+    system.epoch = QVAULT_FROZEN_STAKE_ESCROW_EPOCH - 1;
+    qvault.beginEpoch();
+    EXPECT_EQ(qvault.getState()->numberOfStaker, 2);
+    EXPECT_EQ(qvault.getState()->totalStakedQcapAmount, frozenAmount + normalAmount);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, escrow, escrow, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), 0);
+
+    const sint64 qvaultQcapBefore = numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX);
+
+    system.epoch = QVAULT_FROZEN_STAKE_ESCROW_EPOCH;
+    qvault.beginEpoch();
+
+    // frozen stake is now in FROZEN_ESCROW, still managed by QVAULT
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, escrow, escrow, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), frozenAmount);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), qvaultQcapBefore - frozenAmount);
+
+    // only the normal staker is left in both lists
+    QVAULTChecker* state = qvault.getState();
+    EXPECT_EQ(state->numberOfStaker, 1);
+    EXPECT_EQ(state->staker.get(0).stakerAddress, normalStaker);
+    EXPECT_EQ(state->staker.get(0).amount, normalAmount);
+    EXPECT_EQ(state->staker.get(1).amount, 0);
+    EXPECT_EQ(state->totalStakedQcapAmount, normalAmount);
+    EXPECT_EQ(state->numberOfVotingPower, 1);
+    EXPECT_EQ(state->votingPower.get(0).stakerAddress, normalStaker);
+    EXPECT_EQ(state->votingPower.get(0).amount, normalAmount);
+    EXPECT_EQ(state->votingPower.get(1).amount, 0);
+    EXPECT_EQ(state->totalVotingPower, normalAmount);
+
+    // running again in the same epoch changes nothing
+    qvault.beginEpoch();
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, escrow, escrow, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), frozenAmount);
+    EXPECT_EQ(state->numberOfStaker, 1);
+    EXPECT_EQ(state->totalStakedQcapAmount, normalAmount);
+
+    // the normal staker can still unstake everything
+    increaseEnergy(normalStaker, QVAULT_UNSTAKE_FEE);
+    EXPECT_EQ(qvault.unStake(normalStaker, normalAmount), QVAULT_SUCCESS);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, normalStaker, normalStaker, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), normalAmount);
+    EXPECT_EQ(state->numberOfStaker, 0);
+    EXPECT_EQ(state->totalStakedQcapAmount, 0);
+}
+
+TEST(TestContractQvault, passedProposalsTakeEffectNextEpoch)
+{
+    const uint32 cutover = QVAULT_FAST_PROPOSAL_EFFECT_EPOCH;
+    system.epoch = cutover - 2;
+    ContractTestingQvault qvault;
+    QVAULTChecker* state = qvault.getState();
+
+    // quorum change proposed before the cutover keeps the old timing (two epochs later)
+    QVAULT::QCPInfo qcp;
+    setMemory(qcp, 0);
+    qcp.proposedEpoch = cutover - 2;
+    qcp.newQuorumPercent = 400;
+    qcp.result = QVAULT_PROPOSAL_PASSED;
+    state->QCP.set(0, qcp);
+    state->numberOfQCP = 1;
+    const uint32 initialQuorum = state->quorumPercent;
+    ASSERT_NE(initialQuorum, 400u);
+
+    system.epoch = cutover - 1;
+    qvault.beginEpoch();
+    EXPECT_EQ(state->quorumPercent, initialQuorum);
+    system.epoch = cutover;
+    qvault.beginEpoch();
+    EXPECT_EQ(state->quorumPercent, 400u);
+
+    // quorum change and allocation proposed in the cutover epoch apply as soon as the next epoch begins
+    qcp.proposedEpoch = cutover;
+    qcp.newQuorumPercent = 500;
+    state->QCP.set(1, qcp);
+    state->numberOfQCP = 2;
+
+    QVAULT::AlloPInfo allo;
+    setMemory(allo, 0);
+    allo.proposedEpoch = cutover;
+    allo.distributed = 950;
+    allo.reinvested = 20;
+    allo.burnQcap = 0;
+    allo.result = QVAULT_PROPOSAL_PASSED;
+    state->AlloP.set(0, allo);
+    state->numberOfAlloP = 1;
+    const uint32 initialDistributed = state->QCAPHolderPermille;
+    ASSERT_NE(initialDistributed, 950u);
+
+    // QCAP sale proposed in the cutover epoch opens in the next epoch
+    uint64 qcapAssetName = assetNameFromString("QCAP");
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_ISSUE_ASSET_FEE);
+    EXPECT_EQ(qvault.issueAsset(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, 0, 0), QVAULT_QCAP_MAX_SUPPLY);
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID), QVAULT_QCAP_MAX_SUPPLY);
+
+    QVAULT::FundPInfo fund;
+    setMemory(fund, 0);
+    fund.proposedEpoch = cutover;
+    fund.pricePerOneQcap = 100000;
+    fund.amountOfQcap = 1000;
+    fund.restSaleAmount = 1000;
+    fund.result = QVAULT_PROPOSAL_PASSED;
+    state->FundP.set(0, fund);
+    state->numberOfFundP = 1;
+
+    setMemory(utcTime, 0);
+    utcTime.Year = 2026;
+    utcTime.Month = 12;
+    utcTime.Day = 1;
+    updateQpiTime();
+
+    const id buyer = getUser(7);
+    const uint32 buyAmount = 100;
+    const uint64 payment = fund.pricePerOneQcap * buyAmount;
+    increaseEnergy(buyer, payment);
+    EXPECT_EQ(qvault.buyQcap(buyer, buyAmount, payment), QVAULT_FAILED);   // still the voting epoch
+    EXPECT_EQ(getBalance(buyer), payment);                                  // payment refunded
+
+    system.epoch = cutover + 1;
+    qvault.beginEpoch();
+    EXPECT_EQ(state->quorumPercent, 500u);
+    EXPECT_EQ(state->QCAPHolderPermille, 950u);
+    EXPECT_EQ(state->reinvestingPermille, 20u);
+    EXPECT_EQ(state->qcapBurnPermille, 0u);
+
+    EXPECT_EQ(qvault.buyQcap(buyer, buyAmount, payment), QVAULT_SUCCESS);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, buyer, buyer, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), buyAmount);
+    EXPECT_EQ(state->FundP.get(0).restSaleAmount, 1000u - buyAmount);
+}
+
+TEST(TestContractQvault, treasuryProposals)
+{
+    system.epoch = 138;
+    ContractTestingQvault qvault;
+    QVAULTChecker* state = qvault.getState();
+
+    const uint64 qcapAssetName = assetNameFromString("QCAP");
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_ISSUE_ASSET_FEE);
+    EXPECT_EQ(qvault.issueAsset(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, 0, 0), QVAULT_QCAP_MAX_SUPPLY);
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID), QVAULT_QCAP_MAX_SUPPLY);
+
+    // one staker with 10000 voting power
+    const id staker = getUser(1);
+    increaseEnergy(QVAULT_CONTRACT_ID, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, 10000, QVAULT_CONTRACT_ID, staker), 10000);
+    increaseEnergy(staker, QVAULT_UNSTAKE_FEE);
+    EXPECT_EQ(qvault.QXTransferShareManagementRights(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_CONTRACT_INDEX, 10000, staker), 10000);
+    EXPECT_EQ(qvault.stake(staker, 10000), QVAULT_SUCCESS);
+    qvault.endEpoch();
+    system.epoch++;
+    ASSERT_EQ(state->totalVotingPower, 10000u);
+
+    // another token received by QVAULT on QX
+    const id tokenIssuer = getUser(2);
+    const uint64 tokenName = assetNameFromString("TOKEN");
+    increaseEnergy(tokenIssuer, QVAULT_ISSUE_ASSET_FEE);
+    EXPECT_EQ(qvault.issueAsset(tokenIssuer, tokenName, 1000, 0, 0), 1000);
+    increaseEnergy(tokenIssuer, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(tokenIssuer, tokenName, 1000, tokenIssuer, QVAULT_CONTRACT_ID), 1000);
+
+    // reinvesting fund backed by real balance
+    const uint64 fund = 5000000000ull;
+    increaseEnergy(QVAULT_CONTRACT_ID, fund);
+    state->reinvestingFund = fund;
+
+    setMemory(utcTime, 0);
+    utcTime.Year = 2029;
+    utcTime.Month = 1;
+    utcTime.Day = 3;
+    updateQpiTime();
+
+    const id destination = getUser(3);
+    const uint32 qcapSoldBefore = state->qcapSoldAmount;
+
+    // invalid inputs are refused before any proposal is stored
+    increaseEnergy(staker, QVAULT_PROPOSAL_FEE * 20);
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SELL_ASSET, NULL_ID, QVAULT_QCAP_ISSUER, qcapAssetName, 0, 100, 1000), QVAULT_INPUT_ERROR); // QCAP sales go through FundP
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_QU, NULL_ID, NULL_ID, 0, 1000, 0, 0), QVAULT_INPUT_ERROR);                        // no destination
+    EXPECT_EQ(qvault.submitTreasuryP(staker, 9, destination, NULL_ID, 0, 1000, 0, 0), QVAULT_INPUT_ERROR);                                         // unknown action
+    increaseEnergy(getUser(4), QVAULT_PROPOSAL_FEE);
+    EXPECT_EQ(qvault.submitTreasuryP(getUser(4), QVAULT_TREASURY_SEND_QU, destination, NULL_ID, 0, 1000, 0, 0), QVAULT_NO_VOTING_POWER);            // not a staker
+    EXPECT_EQ(getBalance(getUser(4)), QVAULT_PROPOSAL_FEE);                                                                                         // fee refunded
+    EXPECT_EQ(qvault.getTreasuryP(0).numberOfTreasuryP, 0u);
+
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_QU, destination, NULL_ID, 0, 1000000000ull, 0, 0), QVAULT_SUCCESS);           // 0: release 1B Qu
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_QU, destination, NULL_ID, 0, 1000000000000ull, 0, 0), QVAULT_SUCCESS);        // 1: more than the fund
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_ASSET, destination, tokenIssuer, tokenName, 0, 300, 0), QVAULT_SUCCESS);       // 2: send 300 TOKEN
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_ASSET, destination, QVAULT_QCAP_ISSUER, qcapAssetName, 0, 500, 0), QVAULT_SUCCESS); // 3: send 500 unsold QCAP
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SELL_ASSET, NULL_ID, tokenIssuer, tokenName, 0, 200, 1000), QVAULT_SUCCESS);        // 4: sell 200 TOKEN at 1000
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_QU, destination, NULL_ID, 0, 7, 0, 0), QVAULT_SUCCESS);                        // 5: voted down
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_QU, destination, NULL_ID, 0, 9, 0, 0), QVAULT_SUCCESS);                        // 6: nobody votes
+    EXPECT_EQ(qvault.submitTreasuryP(staker, QVAULT_TREASURY_SEND_ASSET, destination, tokenIssuer, tokenName, 0, 5000, 0), QVAULT_SUCCESS);      // 7: more TOKEN than QVAULT has
+    EXPECT_EQ(qvault.getTreasuryP(0).numberOfTreasuryP, 8u);
+    EXPECT_EQ(qvault.getTreasuryP(2).proposal.result, QVAULT_PROPOSAL_NOT_STARTED);
+
+    for (uint32 i : { 0u, 1u, 2u, 3u, 4u, 7u })
+    {
+        EXPECT_EQ(qvault.voteInProposal(staker, 0, QVAULT_PROPOSAL_TYPE_TREASURY, i, 1), QVAULT_SUCCESS);
+    }
+    EXPECT_EQ(qvault.voteInProposal(staker, 0, QVAULT_PROPOSAL_TYPE_TREASURY, 5, 0), QVAULT_SUCCESS);
+    EXPECT_EQ(qvault.voteInProposal(staker, 0, QVAULT_PROPOSAL_TYPE_TREASURY, 8, 1), QVAULT_OVERFLOW_PROPOSAL);
+    EXPECT_EQ(qvault.getTreasuryP(0).proposal.numberOfYes, 10000u);
+    EXPECT_EQ(qvault.getTreasuryP(5).proposal.numberOfNo, 10000u);
+
+    const sint64 qcapInQvaultBefore = numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_ID, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX);
+    const sint64 stakedQcapBefore = numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX);
+    const uint64 transferFee = qvault.qxGetState()->_transferFee;
+
+    qvault.endEpoch();
+
+    // 0: Qu released from the reinvesting fund
+    EXPECT_EQ(qvault.getTreasuryP(0).proposal.result, QVAULT_PROPOSAL_PASSED);
+    EXPECT_EQ(getBalance(destination), 1000000000);
+    // 1: more than the fund, nothing sent
+    EXPECT_EQ(qvault.getTreasuryP(1).proposal.result, QVAULT_PROPOSAL_EXECUTION_FAILED);
+    // 2: token sent
+    EXPECT_EQ(qvault.getTreasuryP(2).proposal.result, QVAULT_PROPOSAL_PASSED);
+    EXPECT_EQ(numberOfPossessedShares(tokenName, tokenIssuer, destination, destination, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX), 300);
+    // 3: unsold QCAP sent and counted toward the sale limit; staked QCAP untouched
+    EXPECT_EQ(qvault.getTreasuryP(3).proposal.result, QVAULT_PROPOSAL_PASSED);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, destination, destination, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX), 500);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_ID, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX), qcapInQvaultBefore - 500);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), stakedQcapBefore);
+    EXPECT_EQ(state->qcapSoldAmount, qcapSoldBefore + 500);
+    // 4: ask order placed on QX
+    EXPECT_EQ(qvault.getTreasuryP(4).proposal.result, QVAULT_PROPOSAL_PASSED);
+    auto asks = qvault.AssetAskOrders(tokenIssuer, tokenName, 0);
+    EXPECT_EQ(asks.orders.get(0).entity, QVAULT_CONTRACT_ID);
+    EXPECT_EQ(asks.orders.get(0).price, 1000);
+    EXPECT_EQ(asks.orders.get(0).numberOfShares, 200);
+    // 5: rejected, 6: no quorum, 7: not enough shares
+    EXPECT_EQ(qvault.getTreasuryP(5).proposal.result, QVAULT_PROPOSAL_REJECTED);
+    EXPECT_EQ(qvault.getTreasuryP(6).proposal.result, QVAULT_PROPOSAL_INSUFFICIENT_QUORUM);
+    EXPECT_EQ(qvault.getTreasuryP(7).proposal.result, QVAULT_PROPOSAL_EXECUTION_FAILED);
+    EXPECT_EQ(numberOfPossessedShares(tokenName, tokenIssuer, destination, destination, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX), 300);
+
+    // fund paid the released Qu and two QX transfer fees only
+    EXPECT_EQ(state->reinvestingFund, fund - 1000000000ull - 2 * transferFee);
+
+    // passed proposals of an earlier epoch are not run again
+    system.epoch++;
+    qvault.beginEpoch();
+    qvault.endEpoch();
+    EXPECT_EQ(getBalance(destination), 1000000000);
+    EXPECT_EQ(state->reinvestingFund, fund - 1000000000ull - 2 * transferFee);
+}
+
+// QVAULT plus TESTEXA, a test contract that runs shareholder polls
+class ContractTestingQvaultPoll : public ContractTestingQvault
+{
+public:
+    ContractTestingQvaultPoll()
+    {
+        INIT_CONTRACT(TESTEXA);
+        callSystemProcedure(TESTEXA_CONTRACT_INDEX, INITIALIZE);
+    }
+
+    uint32 submitPollP(const id& address, uint64 shareAssetName, uint32 contractIndex, uint32 pollTick, uint16 pollIndex, uint16 pollType, uint8 numberOfOptions)
+    {
+        QVAULT::submitPollP_input input;
+        QVAULT::submitPollP_output output;
+        setMemory(input, 0);
+        input.shareAssetName = shareAssetName;
+        input.contractIndex = contractIndex;
+        input.pollTick = pollTick;
+        input.pollIndex = pollIndex;
+        input.pollType = pollType;
+        input.numberOfOptions = numberOfOptions;
+        invokeUserProcedure(QVAULT_CONTRACT_INDEX, 15, input, output, address, QVAULT_PROPOSAL_FEE);
+        return output.returnCode;
+    }
+
+    QVAULT::voteInPollP_output voteInPollP(const id& address, uint32 proposalId, uint8 option)
+    {
+        QVAULT::voteInPollP_input input{ proposalId, option };
+        QVAULT::voteInPollP_output output;
+        setMemory(output, 0);
+        invokeUserProcedure(QVAULT_CONTRACT_INDEX, 16, input, output, address, 0);
+        return output;
+    }
+
+    QVAULT::getPollP_output getPollP(uint32 proposalId) const
+    {
+        QVAULT::getPollP_input input{ proposalId };
+        QVAULT::getPollP_output output;
+        callFunction(QVAULT_CONTRACT_INDEX, 24, input, output);
+        return output;
+    }
+
+    QVAULT::getVoteInProposal_output getVoteInProposal(const id& user, uint64 proposalType, uint64 proposalId) const
+    {
+        QVAULT::getVoteInProposal_input input{ user, proposalType, proposalId };
+        QVAULT::getVoteInProposal_output output;
+        callFunction(QVAULT_CONTRACT_INDEX, 21, input, output);
+        return output;
+    }
+
+    // yes/no poll in TESTEXA about setting its variable 3 to 100
+    uint16 openTestExAPoll(const id& proposer)
+    {
+        TESTEXA::SetShareholderProposal_input input;
+        setMemory(input, 0);
+        input.proposalData.epoch = system.epoch;
+        input.proposalData.type = ProposalTypes::VariableYesNo;
+        input.proposalData.data.variableOptions.variable = 2;
+        input.proposalData.data.variableOptions.value = 100;
+        TESTEXA::SetShareholderProposal_output output = INVALID_PROPOSAL_INDEX;
+        EXPECT_TRUE(invokeUserProcedure(TESTEXA_CONTRACT_INDEX, 65534, input, output, proposer, 0));
+        return output;
+    }
+
+    TESTEXA::GetShareholderProposal_output getTestExAPoll(uint16 pollIndex) const
+    {
+        TESTEXA::GetShareholderProposal_input input{ pollIndex };
+        TESTEXA::GetShareholderProposal_output output;
+        callFunction(TESTEXA_CONTRACT_INDEX, 65533, input, output);
+        return output;
+    }
+
+    // votes QVAULT cast in the TESTEXA poll for the given value
+    uint32 qvaultVotesInTestExAPoll(uint16 pollIndex, sint64 value) const
+    {
+        TESTEXA::GetShareholderVotes_input input{ QVAULT_CONTRACT_ID, pollIndex };
+        TESTEXA::GetShareholderVotes_output output;
+        callFunction(TESTEXA_CONTRACT_INDEX, 65534, input, output);
+        uint32 count = 0;
+        for (int i = 0; i < output.voteCounts.capacity(); ++i)
+        {
+            if (output.voteValues.get(i) == value)
+                count += output.voteCounts.get(i);
+        }
+        return count;
+    }
+};
+
+TEST(TestContractQvault, pollProposalCastsSharesLive)
+{
+    system.epoch = 200;
+    ContractTestingQvaultPoll qvault;
+
+    const uint64 qcapAssetName = assetNameFromString("QCAP");
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_ISSUE_ASSET_FEE);
+    EXPECT_EQ(qvault.issueAsset(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, 0, 0), QVAULT_QCAP_MAX_SUPPLY);
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID), QVAULT_QCAP_MAX_SUPPLY);
+
+    // stakers A (12000) and B (8000); creating a proposal needs 10000
+    const id stakerA = getUser(1);
+    const id stakerB = getUser(2);
+    const id stakers[2] = { stakerA, stakerB };
+    const uint32 amounts[2] = { 12000, 8000 };
+    for (int i = 0; i < 2; i++)
+    {
+        increaseEnergy(QVAULT_CONTRACT_ID, QVAULT_TOKEN_TRANSFER_FEE);
+        EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, amounts[i], QVAULT_CONTRACT_ID, stakers[i]), amounts[i]);
+        increaseEnergy(stakers[i], QVAULT_UNSTAKE_FEE);
+        EXPECT_EQ(qvault.QXTransferShareManagementRights(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_CONTRACT_INDEX, amounts[i], stakers[i]), amounts[i]);
+        EXPECT_EQ(qvault.stake(stakers[i], amounts[i]), QVAULT_SUCCESS);
+    }
+    qvault.endEpoch();
+    system.epoch++;
+
+    // QVAULT owns 100 of the 676 TESTEXA shares; a shareholder opens a yes/no poll
+    const id shareholder = getUser(10);
+    increaseEnergy(shareholder, 1000000);
+    std::vector<std::pair<m256i, unsigned int>> shares{ { shareholder, 576 }, { QVAULT_CONTRACT_ID, 100 } };
+    issueContractShares(TESTEXA_CONTRACT_INDEX, shares);
+    const uint64 testExAName = assetNameFromString("TESTEXA");
+    const uint16 pollIndex = qvault.openTestExAPoll(shareholder);
+    ASSERT_NE((int)pollIndex, (int)INVALID_PROPOSAL_INDEX);
+    const auto poll = qvault.getTestExAPoll(pollIndex).proposal;
+    ASSERT_EQ((int)poll.type, (int)ProposalTypes::VariableYesNo);
+
+    // create the matching QVAULT poll proposal
+    increaseEnergy(stakerA, QVAULT_PROPOSAL_FEE * 5);
+    EXPECT_EQ(qvault.submitPollP(stakerA, assetNameFromString("NOPE"), TESTEXA_CONTRACT_INDEX, poll.tick, pollIndex, poll.type, 2), QVAULT_INSUFFICIENT_SHARE); // QVAULT holds no such shares
+    EXPECT_EQ(qvault.submitPollP(stakerA, testExAName, TESTEXA_CONTRACT_INDEX, poll.tick, pollIndex, poll.type, 1), QVAULT_INPUT_ERROR);                       // too few options
+    EXPECT_EQ(qvault.submitPollP(stakerA, testExAName, TESTEXA_CONTRACT_INDEX, poll.tick, pollIndex, poll.type, 2), QVAULT_SUCCESS);
+    EXPECT_EQ(qvault.submitPollP(stakerA, testExAName, TESTEXA_CONTRACT_INDEX, poll.tick, pollIndex, poll.type, 2), QVAULT_INPUT_ERROR);                       // duplicate
+    EXPECT_EQ(qvault.getPollP(0).numberOfPollP, 1u);
+    EXPECT_EQ((int)qvault.getPollP(0).proposal.castOption, -1);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 0) + qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 0u);
+
+    // B votes yes: QVAULT casts all 100 shares for yes
+    auto voted = qvault.voteInPollP(stakerB, 0, 1);
+    EXPECT_EQ(voted.returnCode, QVAULT_SUCCESS);
+    EXPECT_EQ((int)voted.castOption, 1);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 100u);
+
+    // A (more voting power) votes no: QVAULT switches to no
+    voted = qvault.voteInPollP(stakerA, 0, 0);
+    EXPECT_EQ((int)voted.castOption, 0);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 0), 100u);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 0u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(0), 12000u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(1), 8000u);
+
+    // A changes to yes: QVAULT back to yes, A's power moves
+    voted = qvault.voteInPollP(stakerA, 0, 1);
+    EXPECT_EQ((int)voted.castOption, 1);
+    EXPECT_EQ(qvault.qvaultVotesInTestExAPoll(pollIndex, 1), 100u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(0), 0u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.optionVotes.get(1), 20000u);
+    EXPECT_EQ(qvault.getPollP(0).proposal.totalVotes, 20000u);
+    EXPECT_EQ(qvault.getVoteInProposal(stakerA, QVAULT_PROPOSAL_TYPE_POLL, 0).votingDecision, 1);
+
+    // refused votes
+    EXPECT_EQ(qvault.voteInPollP(stakerA, 0, 1).returnCode, QVAULT_SAME_DECISION);
+    EXPECT_EQ(qvault.voteInPollP(stakerB, 0, 2).returnCode, QVAULT_INPUT_ERROR);       // only options 0 and 1
+    increaseEnergy(getUser(3), 1000);
+    EXPECT_EQ(qvault.voteInPollP(getUser(3), 0, 1).returnCode, QVAULT_NO_VOTING_POWER);
+    EXPECT_EQ(qvault.voteInPollP(stakerA, 1, 1).returnCode, QVAULT_OVERFLOW_PROPOSAL);
+
+    // end of epoch records the outcome
+    qvault.endEpoch();
+    EXPECT_EQ(qvault.getPollP(0).proposal.result, QVAULT_POLL_VOTED);
+    EXPECT_EQ((int)qvault.getPollP(0).proposal.castOption, 1);
+
+    // closed in later epochs
+    system.epoch++;
+    EXPECT_EQ(qvault.voteInPollP(stakerB, 0, 0).returnCode, QVAULT_ENDED_PROPOSAL);
 }

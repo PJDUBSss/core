@@ -21,6 +21,22 @@ constexpr uint32 QVAULT_MIN_STAKE_AMOUNT = 100; // Minimum amount of QCAP to sta
 constexpr uint32 QVAULT_MIN_BUY_QCAP_AMOUNT = 50; // Minimum amount of QCAP to buy
 constexpr uint32 QVAULT_MIN_INCOMING_TRANSFER = 5000000; // Minimum amount of qu for incoming standard transaction
 constexpr uint32 QVAULT_UNSTAKE_FEE = 100000; // Fee required to unstake qcap
+// One-shot move of QCAP staked by frozen identities (see frozen_addresses.h) to FROZEN_ESCROW, run in BEGIN_EPOCH of this epoch
+constexpr uint16 QVAULT_FROZEN_STAKE_ESCROW_EPOCH = 243;
+constexpr uint32 QVAULT_LOG_FROZEN_STAKE_ESCROWED = 1; // Log type: staked QCAP of a frozen identity moved to FROZEN_ESCROW
+// Proposals submitted from this epoch on take effect as soon as the next epoch begins (QCP, AlloP, FundP sale).
+// Proposals submitted earlier keep the old timing of one extra epoch, so nothing already scheduled is skipped.
+constexpr uint32 QVAULT_FAST_PROPOSAL_EFFECT_EPOCH = 243;
+// Treasury proposals (TreasuryP): release Qu from the reinvesting fund, send assets QVAULT holds, or sell assets on QX
+constexpr uint32 QVAULT_MAX_NUMBER_OF_TREASURY_PROPOSAL = 4096; // Maximum number of treasury proposals
+constexpr uint32 QVAULT_PROPOSAL_TYPE_TREASURY = 8;             // proposalType of TreasuryP in voteInProposal / getVoteInProposal
+constexpr uint8 QVAULT_TREASURY_SEND_QU = 1;                    // Send Qu from the reinvesting fund to the destination
+constexpr uint8 QVAULT_TREASURY_SEND_ASSET = 2;                 // Send QX-managed shares QVAULT owns (QCAP included) to the destination
+constexpr uint8 QVAULT_TREASURY_SELL_ASSET = 3;                 // Place a QX ask order for QX-managed shares QVAULT owns (not QCAP)
+// Poll proposals (PollP): QCAP stakers decide how QVAULT casts its shares in a shareholder poll of another contract
+constexpr uint32 QVAULT_MAX_NUMBER_OF_POLL_PROPOSAL = 4096;     // Maximum number of poll proposals
+constexpr uint32 QVAULT_PROPOSAL_TYPE_POLL = 9;                 // proposalType of PollP in the per-user vote history / getVoteInProposal
+constexpr uint8 QVAULT_POLL_MAX_OPTIONS = 8;                    // Options 0 (no) to 7, as in ProposalMultiVoteDataV1
 
 // Yearly QCAP sale limits
 constexpr uint32 QVAULT_2025MAX_QCAP_SALE_AMOUNT = 10714286; // Maximum QCAP sales for 2025
@@ -61,12 +77,29 @@ constexpr uint8 QVAULT_PROPOSAL_INSUFFICIENT_QUORUM = 2;
 constexpr uint8 QVAULT_PROPOSAL_INSUFFICIENT_VOTING_POWER = 3;
 constexpr uint8 QVAULT_PROPOSAL_INSUFFICIENT_QCAP = 4;
 constexpr uint8 QVAULT_PROPOSAL_NOT_STARTED = 5;
+constexpr uint8 QVAULT_PROPOSAL_EXECUTION_FAILED = 6;   // Passed, but could not be carried out (not enough funds or shares, or over the QCAP sale limit)
+constexpr uint8 QVAULT_POLL_VOTED = 0;                  // PollP result: QVAULT cast its shares for castOption
+constexpr uint8 QVAULT_POLL_NO_VOTES = 1;               // PollP result: no staker voted, QVAULT did not vote
 
 /**
  * QVAULT2 - Placeholder struct for future use
  */
 struct QVAULT2
 {
+};
+
+/**
+ * Log record written for every frozen identity whose staked QCAP is moved to FROZEN_ESCROW
+ * @param frozenStaker Frozen identity that had the stake
+ * @param amount Amount of QCAP moved to FROZEN_ESCROW
+ */
+struct QVAULTFrozenStakeLogger
+{
+    uint32 _contractIndex;
+    uint32 _type;
+    id frozenStaker;
+    sint64 amount;
+    sint8 _terminator;
 };
 
 /**
@@ -210,6 +243,52 @@ struct QVAULT : public ContractBase
         uint8 result;                   // Proposal result: 0=passed, 1=rejected, 2=insufficient quorum
     };
     /**
+    * Treasury Proposal (TreasuryP) information structure
+    * Releases Qu from the reinvesting fund, sends assets QVAULT holds, or sells assets on QX
+    */
+    struct TreasuryPInfo
+    {
+        id proposer;                    // Address of the proposal creator
+        id destination;                 // Receiver of Qu or shares (SEND_QU, SEND_ASSET)
+        id assetIssuer;                 // Issuer of the asset (SEND_ASSET, SELL_ASSET)
+        uint64 assetName;               // Name of the asset (SEND_ASSET, SELL_ASSET)
+        uint64 amountOfQubic;           // Qu to release from the reinvesting fund (SEND_QU)
+        sint64 numberOfShares;          // Number of shares to send or sell (SEND_ASSET, SELL_ASSET)
+        sint64 pricePerShare;           // Ask price per share in Qu (SELL_ASSET)
+        uint32 currentTotalVotingPower; // Total voting power when proposal was created
+        uint32 numberOfYes;             // Number of yes votes received
+        uint32 numberOfNo;              // Number of no votes received
+        uint32 proposedEpoch;           // Epoch when proposal was created
+        uint32 currentQuorumPercent;    // Quorum percentage when proposal was created
+        Array<uint8, QVAULT_MAX_URLS_COUNT> url;          // URL containing proposal details
+        uint8 action;                   // QVAULT_TREASURY_SEND_QU, QVAULT_TREASURY_SEND_ASSET or QVAULT_TREASURY_SELL_ASSET
+        uint8 result;                   // Proposal result: 0=passed and executed, 1=rejected, 2=insufficient quorum, 5=not started, 6=execution failed
+    };
+
+    /**
+    * Poll Proposal (PollP) information structure
+    * Mirrors a shareholder poll of another contract in which QVAULT holds shares.
+    * Stakers pick an option; QVAULT casts all its shares for the leading option, updated after every vote.
+    */
+    struct PollPInfo
+    {
+        id proposer;                    // Address of the proposal creator
+        uint64 shareAssetName;          // Asset name of the contract's shares (e.g. QPUMP), issuer NULL_ID
+        uint32 currentTotalVotingPower; // Total voting power when proposal was created
+        uint32 proposedEpoch;           // Epoch when proposal was created (polls are open during one epoch)
+        uint32 contractIndex;           // Contract running the shareholder poll
+        uint32 pollTick;                // Tick the poll was set in (must match the poll's current version)
+        uint32 totalVotes;              // Voting power of all stakers who voted
+        uint16 pollIndex;               // Index of the shareholder proposal in that contract
+        uint16 pollType;                // ProposalTypes type of the shareholder proposal
+        Array<uint32, QVAULT_POLL_MAX_OPTIONS> optionVotes; // Voting power per option (0 = no, 1..N = options of the poll)
+        Array<uint8, QVAULT_MAX_URLS_COUNT> url;          // URL containing proposal details
+        uint8 numberOfOptions;          // Number of options of the poll (2..8)
+        sint8 castOption;               // Option QVAULT's shares are currently cast for, -1 if none
+        uint8 result;                   // 0 = QVAULT voted (castOption), 1 = no staker voted, 5 = not started
+    };
+
+    /**
     * Vote status information structure
     * Tracks individual user votes on proposals
     */
@@ -294,6 +373,12 @@ struct QVAULT : public ContractBase
         uint32 quorumPercent;               // Current quorum percentage for proposals 
 
         HashMap<id, uint8, 16384> userEpochActionsFlags;
+
+        // Appended in v2.1 (state extended with PADDING, existing variables unchanged)
+        Array<TreasuryPInfo, QVAULT_MAX_NUMBER_OF_TREASURY_PROPOSAL> TreasuryP; // Storage array for treasury proposals
+        uint32 numberOfTreasuryP;           // Number of Treasury Proposals
+        Array<PollPInfo, QVAULT_MAX_NUMBER_OF_POLL_PROPOSAL> PollP;               // Storage array for poll proposals
+        uint32 numberOfPollP;               // Number of Poll Proposals
     };
 public:
 
@@ -542,9 +627,93 @@ public:
     };
 
     /**
+     * Input structure for submitTreasuryP (Treasury Proposal) function
+     * @param destination Receiver of Qu or shares (SEND_QU, SEND_ASSET)
+     * @param assetIssuer Issuer of the asset (SEND_ASSET, SELL_ASSET)
+     * @param assetName Name of the asset (SEND_ASSET, SELL_ASSET)
+     * @param amountOfQubic Qu to release from the reinvesting fund (SEND_QU)
+     * @param numberOfShares Number of shares to send or sell (SEND_ASSET, SELL_ASSET)
+     * @param pricePerShare Ask price per share in Qu (SELL_ASSET)
+     * @param action QVAULT_TREASURY_SEND_QU, QVAULT_TREASURY_SEND_ASSET or QVAULT_TREASURY_SELL_ASSET
+     * @param url URL containing proposal details (max 256 bytes)
+     */
+    struct submitTreasuryP_input
+    {
+        id destination;
+        id assetIssuer;
+        uint64 assetName;
+        uint64 amountOfQubic;
+        sint64 numberOfShares;
+        sint64 pricePerShare;
+        uint8 action;
+        Array<uint8, QVAULT_MAX_URLS_COUNT> url;
+    };
+
+    /**
+     * Output structure for submitTreasuryP function
+     * @param returnCode Status code indicating success or failure
+     */
+    struct submitTreasuryP_output
+    {
+        sint32 returnCode;
+    };
+
+    /**
+     * Input structure for submitPollP (Poll Proposal) function
+     * @param shareAssetName Asset name of the contract's shares QVAULT holds (e.g. QPUMP)
+     * @param contractIndex Contract running the shareholder poll
+     * @param pollTick Tick the poll was set in (from the contract's GetShareholderProposal)
+     * @param pollIndex Index of the shareholder proposal in that contract
+     * @param pollType ProposalTypes type of the shareholder proposal
+     * @param numberOfOptions Number of options of the poll including option 0 (no), 2..8
+     * @param url URL containing proposal details (max 256 bytes)
+     */
+    struct submitPollP_input
+    {
+        uint64 shareAssetName;
+        uint32 contractIndex;
+        uint32 pollTick;
+        uint16 pollIndex;
+        uint16 pollType;
+        uint8 numberOfOptions;
+        Array<uint8, QVAULT_MAX_URLS_COUNT> url;
+    };
+
+    /**
+     * Output structure for submitPollP function
+     * @param returnCode Status code indicating success or failure
+     */
+    struct submitPollP_output
+    {
+        sint32 returnCode;
+    };
+
+    /**
+     * Input structure for voteInPollP function
+     * @param proposalId ID of the poll proposal
+     * @param option Option to vote for (0 = no, 1..N)
+     */
+    struct voteInPollP_input
+    {
+        uint32 proposalId;
+        uint8 option;
+    };
+
+    /**
+     * Output structure for voteInPollP function
+     * @param castOption Option QVAULT's shares are cast for after this vote (-1 if none)
+     * @param returnCode Status code indicating success or failure
+     */
+    struct voteInPollP_output
+    {
+        sint32 returnCode;
+        sint8 castOption;
+    };
+
+    /**
      * Input structure for voteInProposal function
      * @param priceOfIPO IPO price for IPO participation proposals
-     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP)
+     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP, 8=TreasuryP)
      * @param proposalId ID of the proposal to vote on
      * @param yes Voting decision (1=yes, 0=no)
      */
@@ -615,6 +784,15 @@ public:
          res = ((_year - 24) << 26) | (_month << 22) | (_day << 17) | (_hour << 12) | (_minute << 6) | (_second);
      }
  
+     /**
+     * @return first epoch in which a passed QCP, AlloP or FundP takes effect
+     * Voting ends when the proposal's epoch ends; from QVAULT_FAST_PROPOSAL_EFFECT_EPOCH on the result applies in the very next epoch
+     */
+     inline static uint32 qvaultProposalEffectEpoch(uint32 proposedEpoch)
+     {
+         return proposedEpoch >= QVAULT_FAST_PROPOSAL_EFFECT_EPOCH ? proposedEpoch + 1 : proposedEpoch + 2;
+     }
+
      inline static uint32 qvaultGetYear(uint32 data)
      {
          return ((data >> 26) + 24);
@@ -705,7 +883,7 @@ public:
         output.circulatingSupply = (uint32)(qpi.numberOfShares(locals.qcapAsset) - qpi.numberOfShares(locals.qcapAsset, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) + state.get().totalStakedQcapAmount);
         for (locals._t = state.get().numberOfFundP - 1; locals._t >= 0; locals._t--)
         {
-            if (state.get().FundP.get(locals._t).result == 0 && state.get().FundP.get(locals._t).proposedEpoch + 1 < qpi.epoch())
+            if (state.get().FundP.get(locals._t).result == 0 && qvaultProposalEffectEpoch(state.get().FundP.get(locals._t).proposedEpoch) <= qpi.epoch())
             {
                 output.qcapMarketCap = output.circulatingSupply * state.get().FundP.get(locals._t).pricePerOneQcap;
                 break;
@@ -1696,6 +1874,419 @@ public:
     }
 
     /**
+     * Local variables for submitTreasuryP function
+     */
+    struct submitTreasuryP_locals
+    {
+        Asset qvaultShare;              // QVAULT share asset information
+        TreasuryPInfo newProposal;      // New treasury proposal to create
+        sint32 _t;                      // Loop counter variable
+    };
+
+    /**
+     * Submits a Treasury Proposal (TreasuryP)
+     * SEND_QU releases Qu from the reinvesting fund, SEND_ASSET sends QX-managed shares owned by QVAULT
+     * (QCAP included, counted against the yearly QCAP sale limits), SELL_ASSET places a QX ask order for
+     * QX-managed shares owned by QVAULT (QCAP excluded, use FundP for QCAP sales).
+     * Staked QCAP is managed by QVAULT, not QX, so it can never be released.
+     * Requires minimum voting power (10000) or QVAULT shares, and the proposal fee.
+     * A passed proposal is carried out at the end of the epoch it was voted in.
+     *
+     * @param input Action, destination, amounts, asset and URL containing proposal details
+     * @param output Status code indicating success or failure
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(submitTreasuryP)
+    {
+        locals.qvaultShare.assetName = QVAULT_QVAULT_ASSETNAME;
+        locals.qvaultShare.issuer = NULL_ID;
+
+        for (locals._t = 0 ; locals._t < (sint64)state.get().numberOfVotingPower; locals._t++)
+        {
+            if (state.get().votingPower.get(locals._t).stakerAddress == qpi.invocator())
+            {
+                if (state.get().votingPower.get(locals._t).amount >= QVAULT_MIN_VOTING_POWER)
+                {
+                    break;
+                }
+                else
+                {
+                    if (qpi.numberOfShares(locals.qvaultShare, AssetOwnershipSelect::byOwner(qpi.invocator()), AssetPossessionSelect::byPossessor(qpi.invocator())) <= 0)
+                    {
+                        output.returnCode = QVAULT_INSUFFICIENT_VOTING_POWER;
+                        if (qpi.invocationReward() > 0)
+                        {
+                            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                        }
+                        return ;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (locals._t == state.get().numberOfVotingPower && qpi.numberOfShares(locals.qvaultShare, AssetOwnershipSelect::byOwner(qpi.invocator()), AssetPossessionSelect::byPossessor(qpi.invocator())) <= 0)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_NO_VOTING_POWER;
+            return ;
+        }
+
+        if ((input.action == QVAULT_TREASURY_SEND_QU && (input.amountOfQubic == 0 || input.destination == NULL_ID))
+            || (input.action == QVAULT_TREASURY_SEND_ASSET && (input.numberOfShares <= 0 || input.assetName == 0 || input.destination == NULL_ID || input.destination == SELF))
+            || (input.action == QVAULT_TREASURY_SELL_ASSET && (input.numberOfShares <= 0 || input.assetName == 0 || input.pricePerShare <= 0
+                || (input.assetName == QVAULT_QCAP_ASSETNAME && input.assetIssuer == state.get().QCAP_ISSUER)))
+            || input.action < QVAULT_TREASURY_SEND_QU || input.action > QVAULT_TREASURY_SELL_ASSET)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+
+        if (qpi.invocationReward() < QVAULT_PROPOSAL_FEE)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INSUFFICIENT_FUND;
+            return ;
+        }
+        if (state.get().numberOfTreasuryP >= QVAULT_MAX_NUMBER_OF_TREASURY_PROPOSAL)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+            return ;
+        }
+        if (qpi.invocationReward() > QVAULT_PROPOSAL_FEE)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward() - QVAULT_PROPOSAL_FEE);
+        }
+        state.mut().proposalCreateFund += QVAULT_PROPOSAL_FEE;
+
+        locals.newProposal.currentQuorumPercent = state.get().quorumPercent;
+        locals.newProposal.currentTotalVotingPower = state.get().totalVotingPower;
+        for (locals._t = 0; locals._t < QVAULT_MAX_URLS_COUNT; locals._t++)
+        {
+            locals.newProposal.url.set(locals._t, input.url.get(locals._t));
+        }
+        locals.newProposal.proposedEpoch = qpi.epoch();
+        locals.newProposal.numberOfYes = 0;
+        locals.newProposal.numberOfNo = 0;
+        locals.newProposal.proposer = qpi.invocator();
+        locals.newProposal.result = QVAULT_PROPOSAL_NOT_STARTED;
+
+        locals.newProposal.action = input.action;
+        locals.newProposal.destination = input.destination;
+        locals.newProposal.assetIssuer = input.assetIssuer;
+        locals.newProposal.assetName = input.assetName;
+        locals.newProposal.amountOfQubic = input.amountOfQubic;
+        locals.newProposal.numberOfShares = input.numberOfShares;
+        locals.newProposal.pricePerShare = input.pricePerShare;
+
+        state.mut().TreasuryP.set(state.get().numberOfTreasuryP, locals.newProposal);
+        state.mut().numberOfTreasuryP++;
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
+     * Local variables for submitPollP function
+     */
+    struct submitPollP_locals
+    {
+        Asset qvaultShare;              // QVAULT share asset information
+        Asset pollShare;                // Shares of the contract running the poll
+        PollPInfo newProposal;          // New poll proposal to create
+        sint32 _t;                      // Loop counter variable
+    };
+
+    /**
+     * Submits a Poll Proposal (PollP) for a shareholder poll of another contract in which QVAULT holds shares
+     * Meant to be created (e.g. by a bot) as soon as the poll appears. Same requirements as other proposals:
+     * minimum voting power (10000) or QVAULT shares, and the proposal fee. One PollP per poll and epoch.
+     *
+     * @param input Poll reference, number of options and URL containing proposal details
+     * @param output Status code indicating success or failure
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(submitPollP)
+    {
+        locals.qvaultShare.assetName = QVAULT_QVAULT_ASSETNAME;
+        locals.qvaultShare.issuer = NULL_ID;
+
+        for (locals._t = 0 ; locals._t < (sint64)state.get().numberOfVotingPower; locals._t++)
+        {
+            if (state.get().votingPower.get(locals._t).stakerAddress == qpi.invocator())
+            {
+                if (state.get().votingPower.get(locals._t).amount >= QVAULT_MIN_VOTING_POWER)
+                {
+                    break;
+                }
+                else
+                {
+                    if (qpi.numberOfShares(locals.qvaultShare, AssetOwnershipSelect::byOwner(qpi.invocator()), AssetPossessionSelect::byPossessor(qpi.invocator())) <= 0)
+                    {
+                        output.returnCode = QVAULT_INSUFFICIENT_VOTING_POWER;
+                        if (qpi.invocationReward() > 0)
+                        {
+                            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                        }
+                        return ;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (locals._t == state.get().numberOfVotingPower && qpi.numberOfShares(locals.qvaultShare, AssetOwnershipSelect::byOwner(qpi.invocator()), AssetPossessionSelect::byPossessor(qpi.invocator())) <= 0)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_NO_VOTING_POWER;
+            return ;
+        }
+
+        if (input.numberOfOptions < 2 || input.numberOfOptions > QVAULT_POLL_MAX_OPTIONS || input.contractIndex == 0 || input.contractIndex == SELF_INDEX)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+
+        // one PollP per poll in an epoch, so stakers' votes are not split across duplicates
+        for (locals._t = state.get().numberOfPollP - 1; locals._t >= 0; locals._t--)
+        {
+            if (state.get().PollP.get(locals._t).proposedEpoch != qpi.epoch())
+            {
+                break;
+            }
+            if (state.get().PollP.get(locals._t).contractIndex == input.contractIndex && state.get().PollP.get(locals._t).pollIndex == input.pollIndex)
+            {
+                if (qpi.invocationReward() > 0)
+                {
+                    qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                }
+                output.returnCode = QVAULT_INPUT_ERROR;
+                return ;
+            }
+        }
+
+        locals.pollShare.assetName = input.shareAssetName;
+        locals.pollShare.issuer = NULL_ID;
+        if (qpi.numberOfShares(locals.pollShare, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) <= 0)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INSUFFICIENT_SHARE;
+            return ;
+        }
+
+        if (qpi.invocationReward() < QVAULT_PROPOSAL_FEE)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_INSUFFICIENT_FUND;
+            return ;
+        }
+        if (state.get().numberOfPollP >= QVAULT_MAX_NUMBER_OF_POLL_PROPOSAL)
+        {
+            if (qpi.invocationReward() > 0)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            }
+            output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+            return ;
+        }
+        if (qpi.invocationReward() > QVAULT_PROPOSAL_FEE)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward() - QVAULT_PROPOSAL_FEE);
+        }
+        state.mut().proposalCreateFund += QVAULT_PROPOSAL_FEE;
+
+        locals.newProposal.currentTotalVotingPower = state.get().totalVotingPower;
+        for (locals._t = 0; locals._t < QVAULT_MAX_URLS_COUNT; locals._t++)
+        {
+            locals.newProposal.url.set(locals._t, input.url.get(locals._t));
+        }
+        locals.newProposal.proposedEpoch = qpi.epoch();
+        locals.newProposal.proposer = qpi.invocator();
+        locals.newProposal.result = QVAULT_PROPOSAL_NOT_STARTED;
+        locals.newProposal.castOption = -1;
+        locals.newProposal.totalVotes = 0;
+
+        locals.newProposal.shareAssetName = input.shareAssetName;
+        locals.newProposal.contractIndex = input.contractIndex;
+        locals.newProposal.pollTick = input.pollTick;
+        locals.newProposal.pollIndex = input.pollIndex;
+        locals.newProposal.pollType = input.pollType;
+        locals.newProposal.numberOfOptions = input.numberOfOptions;
+
+        state.mut().PollP.set(state.get().numberOfPollP, locals.newProposal);
+        state.mut().numberOfPollP++;
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
+     * Local variables for voteInPollP function
+     */
+    struct voteInPollP_locals
+    {
+        PollPInfo poll;                                         // Poll proposal being voted on
+        Array<voteStatusInfo, QVAULT_MAX_USER_VOTES> voteList;  // Vote history of the user in this epoch
+        voteStatusInfo newVote;                                 // Vote entry of the user for this poll
+        ProposalMultiVoteDataV1 voteData;                       // QVAULT's vote in the other contract
+        uint32 power;                                           // Voting power of the user
+        uint32 leaderVotes;                                     // Votes of the leading option
+        sint32 _t;                                              // Loop counter variable
+        sint32 existing;                                        // Index of the user's earlier vote on this poll, -1 if none
+        sint32 leader;                                          // Leading option, -1 if none
+        uint8 countOfVote;                                      // Number of votes of the user in this epoch
+    };
+
+    /**
+     * Votes for an option of a Poll Proposal with the staker's voting power
+     * A staker can change their option while the poll is open. After every vote QVAULT casts all of its shares
+     * for the leading option (ties keep the current option), so the poll always reflects the stakers' result.
+     *
+     * @param input Poll proposal ID and option
+     * @param output Status code and the option QVAULT's shares are cast for
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(voteInPollP)
+    {
+        if (qpi.invocationReward() > 0)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward());
+        }
+        if (input.proposalId >= state.get().numberOfPollP)
+        {
+            output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+            return ;
+        }
+        locals.poll = state.get().PollP.get(input.proposalId);
+        output.castOption = locals.poll.castOption;
+        if (locals.poll.proposedEpoch != qpi.epoch())
+        {
+            output.returnCode = QVAULT_ENDED_PROPOSAL;
+            return ;
+        }
+        if (input.option >= locals.poll.numberOfOptions)
+        {
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+
+        locals.power = 0;
+        for (locals._t = 0 ; locals._t < (sint32)state.get().numberOfVotingPower; locals._t++)
+        {
+            if (state.get().votingPower.get(locals._t).stakerAddress == qpi.invocator())
+            {
+                locals.power = state.get().votingPower.get(locals._t).amount;
+                break;
+            }
+        }
+        if (locals.power == 0)
+        {
+            output.returnCode = QVAULT_NO_VOTING_POWER;
+            return ;
+        }
+
+        // the option is kept in priceOfIPO of the user's vote history entry
+        locals.existing = -1;
+        locals.countOfVote = 0;
+        if (state.get().countOfVote.get(qpi.invocator(), locals.countOfVote))
+        {
+            state.get().vote.get(qpi.invocator(), locals.voteList);
+            for (locals._t = 0; locals._t < locals.countOfVote; locals._t++)
+            {
+                if (locals.voteList.get(locals._t).proposalType == QVAULT_PROPOSAL_TYPE_POLL && locals.voteList.get(locals._t).proposalId == input.proposalId)
+                {
+                    locals.existing = locals._t;
+                }
+            }
+        }
+
+        if (locals.existing >= 0)
+        {
+            if (locals.voteList.get(locals.existing).priceOfIPO == input.option)
+            {
+                output.returnCode = QVAULT_SAME_DECISION;
+                return ;
+            }
+            locals.poll.optionVotes.set((uint32)locals.voteList.get(locals.existing).priceOfIPO, locals.poll.optionVotes.get((uint32)locals.voteList.get(locals.existing).priceOfIPO) - locals.power);
+            locals.newVote = locals.voteList.get(locals.existing);
+            locals.newVote.priceOfIPO = input.option;
+            locals.voteList.set(locals.existing, locals.newVote);
+        }
+        else
+        {
+            if (locals.countOfVote >= QVAULT_MAX_USER_VOTES)
+            {
+                output.returnCode = QVAULT_OVERFLOW_VOTES;
+                return ;
+            }
+            locals.newVote.proposalId = input.proposalId;
+            locals.newVote.proposalType = QVAULT_PROPOSAL_TYPE_POLL;
+            locals.newVote.decision = 1;
+            locals.newVote.priceOfIPO = input.option;
+            locals.voteList.set(locals.countOfVote, locals.newVote);
+            state.mut().countOfVote.set(qpi.invocator(), locals.countOfVote + 1);
+            locals.poll.totalVotes += locals.power;
+        }
+        state.mut().vote.set(qpi.invocator(), locals.voteList);
+        locals.poll.optionVotes.set(input.option, locals.poll.optionVotes.get(input.option) + locals.power);
+
+        // leading option; on a tie the option QVAULT already voted for stays
+        locals.leader = -1;
+        locals.leaderVotes = 0;
+        for (locals._t = 0; locals._t < locals.poll.numberOfOptions; locals._t++)
+        {
+            if (locals.poll.optionVotes.get(locals._t) > locals.leaderVotes
+                || (locals.poll.optionVotes.get(locals._t) == locals.leaderVotes && locals.leaderVotes > 0 && locals._t == locals.poll.castOption))
+            {
+                locals.leader = locals._t;
+                locals.leaderVotes = locals.poll.optionVotes.get(locals._t);
+            }
+        }
+
+        if (locals.leader >= 0 && locals.leader != locals.poll.castOption)
+        {
+            locals.voteData.proposalIndex = locals.poll.pollIndex;
+            locals.voteData.proposalType = locals.poll.pollType;
+            locals.voteData.proposalTick = locals.poll.pollTick;
+            for (locals._t = 0; locals._t < QVAULT_POLL_MAX_OPTIONS; locals._t++)
+            {
+                locals.voteData.voteValues.set(locals._t, 0);
+                locals.voteData.voteCounts.set(locals._t, 0);
+            }
+            locals.voteData.voteValues.set(0, locals.leader); // voteCounts[0] == 0: all of QVAULT's votes
+            if (qpi.setShareholderVotes((uint16)locals.poll.contractIndex, locals.voteData, 0))
+            {
+                locals.poll.castOption = (sint8)locals.leader;
+            }
+        }
+
+        state.mut().PollP.set(input.proposalId, locals.poll);
+        output.castOption = locals.poll.castOption;
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
      * Local variables for voteInProposal function
      */
     struct voteInProposal_locals
@@ -1707,6 +2298,7 @@ public:
         FundPInfo updatedFundProposal;              // Updated fundraising proposal
         MKTPInfo updatedMKTProposal;                // Updated marketplace proposal
         AlloPInfo updatedAlloProposal;              // Updated allocation proposal
+        TreasuryPInfo updatedTreasuryProposal;      // Updated treasury proposal
         Array<voteStatusInfo, QVAULT_MAX_USER_VOTES> newVoteList;      // Updated vote list for user
         voteStatusInfo newVote;                     // New vote to add
         sint32 numberOfYes;                         // Number of yes votes to add
@@ -1727,7 +2319,7 @@ public:
      */
     PUBLIC_PROCEDURE_WITH_LOCALS(voteInProposal)
     {
-        if (input.proposalType > 7 || input.proposalType < 1)
+        if (input.proposalType > QVAULT_PROPOSAL_TYPE_TREASURY || input.proposalType < 1)
         {
             output.returnCode = QVAULT_INPUT_ERROR;
             return ;
@@ -1783,6 +2375,13 @@ public:
                 break;
             case 7:
                 if (input.proposalId >= state.get().numberOfAlloP)
+                {
+                    output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+                    return ;
+                }
+                break;
+            case QVAULT_PROPOSAL_TYPE_TREASURY:
+                if (input.proposalId >= state.get().numberOfTreasuryP)
                 {
                     output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
                     return ;
@@ -1851,6 +2450,10 @@ public:
             case 7:
                 locals.updatedAlloProposal = state.get().AlloP.get(input.proposalId);
                 locals.statusOfProposal = state.get().AlloP.get(input.proposalId).proposedEpoch == qpi.epoch() ? 1 : 0;
+                break;
+            case QVAULT_PROPOSAL_TYPE_TREASURY:
+                locals.updatedTreasuryProposal = state.get().TreasuryP.get(input.proposalId);
+                locals.statusOfProposal = state.get().TreasuryP.get(input.proposalId).proposedEpoch == qpi.epoch() ? 1 : 0;
                 break;
             default:
                 break;
@@ -1932,6 +2535,11 @@ public:
                             locals.updatedAlloProposal.numberOfYes += locals.numberOfYes;
                             locals.updatedAlloProposal.numberOfNo += locals.numberOfNo;
                             state.mut().AlloP.set(input.proposalId, locals.updatedAlloProposal);
+                            break;
+                        case QVAULT_PROPOSAL_TYPE_TREASURY:
+                            locals.updatedTreasuryProposal.numberOfYes += locals.numberOfYes;
+                            locals.updatedTreasuryProposal.numberOfNo += locals.numberOfNo;
+                            state.mut().TreasuryP.set(input.proposalId, locals.updatedTreasuryProposal);
                             break;
                         default:
                             break;
@@ -2071,7 +2679,7 @@ public:
 
         for (locals._t = state.get().numberOfFundP - 1; locals._t >= 0; locals._t--)
         {
-            if (state.get().FundP.get(locals._t).result == 0 && state.get().FundP.get(locals._t).proposedEpoch + 1 < qpi.epoch() && state.get().FundP.get(locals._t).restSaleAmount >= input.amount)
+            if (state.get().FundP.get(locals._t).result == 0 && qvaultProposalEffectEpoch(state.get().FundP.get(locals._t).proposedEpoch) <= qpi.epoch() && state.get().FundP.get(locals._t).restSaleAmount >= input.amount)
             {
                 if (qpi.invocationReward() >= (sint64)state.get().FundP.get(locals._t).pricePerOneQcap * input.amount)
                 {
@@ -2470,6 +3078,84 @@ public:
             return ;
         }
         output.proposal = state.get().AlloP.get(input.proposalId);
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
+     * Input structure for getTreasuryP function
+     * @param proposalId ID of the treasury proposal to retrieve
+     */
+    struct getTreasuryP_input
+    {
+        uint32 proposalId;
+    };
+
+    /**
+     * Output structure for getTreasuryP function
+     * @param numberOfTreasuryP Number of treasury proposals so far
+     * @param proposal Treasury proposal information
+     */
+    struct getTreasuryP_output
+    {
+        sint32 returnCode;                 // Status code indicating success or failure
+        uint32 numberOfTreasuryP;
+        TreasuryPInfo proposal;
+    };
+
+    /**
+     * Retrieves information about a specific Treasury Proposal (TreasuryP)
+     *
+     * @param input Proposal ID to query
+     * @param output Number of treasury proposals and the requested proposal
+     */
+    PUBLIC_FUNCTION(getTreasuryP)
+    {
+        output.numberOfTreasuryP = state.get().numberOfTreasuryP;
+        if (input.proposalId >= state.get().numberOfTreasuryP)
+        {
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+        output.proposal = state.get().TreasuryP.get(input.proposalId);
+        output.returnCode = QVAULT_SUCCESS;
+    }
+
+    /**
+     * Input structure for getPollP function
+     * @param proposalId ID of the poll proposal to retrieve
+     */
+    struct getPollP_input
+    {
+        uint32 proposalId;
+    };
+
+    /**
+     * Output structure for getPollP function
+     * @param numberOfPollP Number of poll proposals so far
+     * @param proposal Poll proposal information
+     */
+    struct getPollP_output
+    {
+        sint32 returnCode;                 // Status code indicating success or failure
+        uint32 numberOfPollP;
+        PollPInfo proposal;
+    };
+
+    /**
+     * Retrieves information about a specific Poll Proposal (PollP)
+     *
+     * @param input Proposal ID to query
+     * @param output Number of poll proposals and the requested proposal
+     */
+    PUBLIC_FUNCTION(getPollP)
+    {
+        output.numberOfPollP = state.get().numberOfPollP;
+        if (input.proposalId >= state.get().numberOfPollP)
+        {
+            output.returnCode = QVAULT_INPUT_ERROR;
+            return ;
+        }
+        output.proposal = state.get().PollP.get(input.proposalId);
         output.returnCode = QVAULT_SUCCESS;
     }
 
@@ -2962,7 +3648,7 @@ public:
     /**
      * Input structure for getVoteInProposal function
      * @param userID user identity
-     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP)
+     * @param proposalType Type of proposal (1=GP, 2=QCP, 3=IPOP, 4=QEarnP, 5=FundP, 6=MKTP, 7=AlloP, 8=TreasuryP, 9=PollP; for PollP votingDecision is the option)
      * @param proposalId ID of the proposal
      */
     struct getVoteInProposal_input
@@ -3006,7 +3692,7 @@ public:
      */
     PUBLIC_FUNCTION_WITH_LOCALS(getVoteInProposal)
     {
-        if (input.proposalType > 7 || input.proposalType < 1)
+        if (input.proposalType > QVAULT_PROPOSAL_TYPE_POLL || input.proposalType < 1)
         {
             output.returnCode = QVAULT_INPUT_ERROR;
             return ;
@@ -3063,6 +3749,20 @@ public:
                     return ;
                 }
                 break;
+            case QVAULT_PROPOSAL_TYPE_TREASURY:
+                if (input.proposalId >= state.get().numberOfTreasuryP)
+                {
+                    output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+                    return ;
+                }
+                break;
+            case QVAULT_PROPOSAL_TYPE_POLL:
+                if (input.proposalId >= state.get().numberOfPollP)
+                {
+                    output.returnCode = QVAULT_OVERFLOW_PROPOSAL;
+                    return ;
+                }
+                break;
         }
 
         if (state.get().countOfVote.get(input.userID, locals.countOfVote))
@@ -3073,7 +3773,8 @@ public:
                 if (locals.voteList.get(locals._r).proposalId == input.proposalId && locals.voteList.get(locals._r).proposalType == input.proposalType)
                 {
                     output.voteStatus++;
-                    output.votingDecision = locals.voteList.get(locals._r).decision;
+                    // for poll proposals the decision is the chosen option
+                    output.votingDecision = input.proposalType == QVAULT_PROPOSAL_TYPE_POLL ? (sint64)locals.voteList.get(locals._r).priceOfIPO : (sint64)locals.voteList.get(locals._r).decision;
                 }
             }
         }
@@ -3131,6 +3832,8 @@ public:
         REGISTER_USER_FUNCTION(getAmountForQearnInUpcomingEpoch, 20);
         REGISTER_USER_FUNCTION(getVoteInProposal, 21);
         REGISTER_USER_FUNCTION(getStakeEpochFlag, 22);
+        REGISTER_USER_FUNCTION(getTreasuryP, 23);
+        REGISTER_USER_FUNCTION(getPollP, 24);
 
         REGISTER_USER_PROCEDURE(stake, 1);
         REGISTER_USER_PROCEDURE(unStake, 2);
@@ -3144,6 +3847,9 @@ public:
         REGISTER_USER_PROCEDURE(voteInProposal, 11);
         REGISTER_USER_PROCEDURE(buyQcap, 12);
         REGISTER_USER_PROCEDURE(TransferShareManagementRights, 13);
+        REGISTER_USER_PROCEDURE(submitTreasuryP, 14);
+        REGISTER_USER_PROCEDURE(submitPollP, 15);
+        REGISTER_USER_PROCEDURE(voteInPollP, 16);
     }
 
     INITIALIZE()
@@ -3174,6 +3880,10 @@ public:
         QX::TransferShareManagementRights_output transferShareManagementRights_output;  // Output from QX transfer rights
         uint32 purchasedQcap;                                                   // Amount of QCAP purchased for burning
         sint32 _t;                                                              // Loop counter variable
+        stakingInfo frozenStake;                                                // Stake entry checked during the frozen stake escrow move
+        stakingInfo emptyStake;                                                 // Zeroed entry used to clear vacated slots
+        id frozenEscrow;                                                        // FROZEN_ESCROW identity (see public_settings.h)
+        QVAULTFrozenStakeLogger frozenStakeLog;                                 // Log record for each escrowed frozen stake
     };
 
     /**
@@ -3183,6 +3893,62 @@ public:
      */
     BEGIN_EPOCH_WITH_LOCALS()
     {
+        // One-shot move of QCAP staked by frozen identities to FROZEN_ESCROW.
+        // Frozen identities cannot send transactions, so their stake could never be unstaked or voted with.
+        // The core already moved their qus and wallet-held shares to FROZEN_ESCROW; staked QCAP is owned by
+        // this contract and was not covered. Owners recover it from FROZEN_ESCROW like their other frozen assets.
+        if (qpi.epoch() == QVAULT_FROZEN_STAKE_ESCROW_EPOCH)
+        {
+            locals.frozenEscrow = ID(_X, _M, _G, _U, _N, _W, _J, _Y, _L, _L, _U, _U, _Z, _A, _N, _F, _E, _W, _J, _N, _N, _I, _D, _M, _X, _N, _S, _D, _M, _P, _O, _V, _F, _A, _H, _W, _O, _E, _R, _K, _D, _D, _A, _W, _D, _R, _E, _Z, _L, _A, _N, _H, _T, _F, _J, _B);
+
+            // remove from staker list; removal moves the last entry into the freed slot, so don't advance after removing
+            locals._t = 0;
+            while (locals._t < (sint32)state.get().numberOfStaker)
+            {
+                locals.frozenStake = state.get().staker.get(locals._t);
+                if (!qpi.isFrozenIdentity(locals.frozenStake.stakerAddress) || locals.frozenStake.amount == 0)
+                {
+                    locals._t++;
+                    continue;
+                }
+
+                if (qpi.transferShareOwnershipAndPossession(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, SELF, SELF, locals.frozenStake.amount, locals.frozenEscrow) < 0)
+                {
+                    locals._t++;
+                    continue;
+                }
+
+                state.mut().totalStakedQcapAmount -= locals.frozenStake.amount;
+
+                locals.frozenStakeLog._contractIndex = SELF_INDEX;
+                locals.frozenStakeLog._type = QVAULT_LOG_FROZEN_STAKE_ESCROWED;
+                locals.frozenStakeLog.frozenStaker = locals.frozenStake.stakerAddress;
+                locals.frozenStakeLog.amount = locals.frozenStake.amount;
+                LOG_INFO(locals.frozenStakeLog);
+
+                state.mut().numberOfStaker--;
+                state.mut().staker.set(locals._t, state.get().staker.get(state.get().numberOfStaker));
+                state.mut().staker.set(state.get().numberOfStaker, locals.emptyStake);
+            }
+
+            // remove from this epoch's voting power snapshot so frozen stake no longer counts toward quorum
+            locals._t = 0;
+            while (locals._t < (sint32)state.get().numberOfVotingPower)
+            {
+                locals.frozenStake = state.get().votingPower.get(locals._t);
+                if (!qpi.isFrozenIdentity(locals.frozenStake.stakerAddress))
+                {
+                    locals._t++;
+                    continue;
+                }
+
+                state.mut().totalVotingPower -= locals.frozenStake.amount;
+                state.mut().numberOfVotingPower--;
+                state.mut().votingPower.set(locals._t, state.get().votingPower.get(state.get().numberOfVotingPower));
+                state.mut().votingPower.set(state.get().numberOfVotingPower, locals.emptyStake);
+            }
+        }
+
         for (locals._t = 0 ; locals._t < (sint32)state.get().numberOfQEarnP; locals._t++)
         {
             if (state.get().QEarnP.get(locals._t).result == 0 && state.get().QEarnP.get(locals._t).proposedEpoch + state.get().QEarnP.get(locals._t).numberOfEpoch + 1 >= qpi.epoch())
@@ -3197,7 +3963,7 @@ public:
 
         for (locals._t = state.get().numberOfQCP - 1 ; locals._t >= 0; locals._t--)
         {
-            if (state.get().QCP.get(locals._t).result == 0 && state.get().QCP.get(locals._t).proposedEpoch + 2 == qpi.epoch())
+            if (state.get().QCP.get(locals._t).result == 0 && qvaultProposalEffectEpoch(state.get().QCP.get(locals._t).proposedEpoch) == qpi.epoch())
             {
                 state.mut().quorumPercent = state.get().QCP.get(locals._t).newQuorumPercent;
                 break;
@@ -3210,7 +3976,7 @@ public:
 
         for (locals._t = state.get().numberOfAlloP - 1; locals._t >= 0; locals._t--)
         {
-            if (state.get().AlloP.get(locals._t).result == 0 && state.get().AlloP.get(locals._t).proposedEpoch + 2 == qpi.epoch())
+            if (state.get().AlloP.get(locals._t).result == 0 && qvaultProposalEffectEpoch(state.get().AlloP.get(locals._t).proposedEpoch) == qpi.epoch())
             {
                 state.mut().QCAPHolderPermille = state.get().AlloP.get(locals._t).distributed;
                 state.mut().reinvestingPermille = state.get().AlloP.get(locals._t).reinvested;
@@ -3275,6 +4041,17 @@ public:
         FundPInfo updatedFundProposal;              // Updated fundraising proposal
         MKTPInfo updatedMKTProposal;                // Updated marketplace proposal
         AlloPInfo updatedAlloProposal;              // Updated allocation proposal
+        TreasuryPInfo updatedTreasuryProposal;      // Updated treasury proposal
+        PollPInfo updatedPollProposal;              // Updated poll proposal
+        QX::Fees_input qxFees_input;                // Input for QX fees query
+        QX::Fees_output qxFees_output;              // QX fees (transfer fee paid for SEND_ASSET)
+        QX::TransferShareOwnershipAndPossession_input qxTransfer_input;     // Input for QX share transfer
+        QX::TransferShareOwnershipAndPossession_output qxTransfer_output;   // Output from QX share transfer
+        QX::AddToAskOrder_input qxAsk_input;        // Input for QX ask order
+        QX::AddToAskOrder_output qxAsk_output;      // Output from QX ask order
+        uint32 qcapSaleLimit;                       // QCAP sale limit of the current year
+        sint32 treasuryStart;                       // Index of the first treasury proposal of this epoch
+        bit treasuryExecuted;                       // Whether a passed treasury proposal was carried out
         Entity entity;                               // Entity information
         AssetPossessionIterator iter;                // Iterator for asset possession
         Asset QCAPId;                                // QCAP asset identifier
@@ -3745,6 +4522,118 @@ public:
             {
                 break;
             }
+        }
+
+        /*
+            Treasury Proposal Result
+            Passed proposals are carried out right away, oldest first. Runs after IPO, QEarn and MKTP
+            so funds they committed this epoch are already taken out of the reinvesting fund.
+        */
+
+        locals.treasuryStart = state.get().numberOfTreasuryP;
+        while (locals.treasuryStart > 0 && state.get().TreasuryP.get(locals.treasuryStart - 1).proposedEpoch == qpi.epoch())
+        {
+            locals.treasuryStart--;
+        }
+
+        packQvaultDate(qpi.year(), qpi.month(), qpi.day(), qpi.hour(), qpi.minute(), qpi.second(), locals.curDate);
+        unpackQvaultDate(locals.year, locals.month, locals.day, locals.hour, locals.minute, locals.second, locals.curDate);
+        locals.qcapSaleLimit = QVAULT_QCAP_MAX_SUPPLY;
+        if (locals.year == 25)
+        {
+            locals.qcapSaleLimit = QVAULT_2025MAX_QCAP_SALE_AMOUNT;
+        }
+        else if (locals.year == 26)
+        {
+            locals.qcapSaleLimit = QVAULT_2026MAX_QCAP_SALE_AMOUNT;
+        }
+        else if (locals.year == 27)
+        {
+            locals.qcapSaleLimit = QVAULT_2027MAX_QCAP_SALE_AMOUNT;
+        }
+
+        for (locals._t = locals.treasuryStart; locals._t < (sint32)state.get().numberOfTreasuryP; locals._t++)
+        {
+            locals.updatedTreasuryProposal = state.get().TreasuryP.get(locals._t);
+            if (locals.updatedTreasuryProposal.numberOfYes + locals.updatedTreasuryProposal.numberOfNo < div(locals.updatedTreasuryProposal.currentQuorumPercent * locals.updatedTreasuryProposal.currentTotalVotingPower * 1ULL, 1000ULL))
+            {
+                locals.updatedTreasuryProposal.result = QVAULT_PROPOSAL_INSUFFICIENT_QUORUM;
+            }
+            else if (locals.updatedTreasuryProposal.numberOfYes <= locals.updatedTreasuryProposal.numberOfNo)
+            {
+                locals.updatedTreasuryProposal.result = QVAULT_PROPOSAL_REJECTED;
+            }
+            else
+            {
+                locals.treasuryExecuted = 0;
+                if (locals.updatedTreasuryProposal.action == QVAULT_TREASURY_SEND_QU)
+                {
+                    if (locals.updatedTreasuryProposal.amountOfQubic <= state.get().reinvestingFund
+                        && qpi.transfer(locals.updatedTreasuryProposal.destination, locals.updatedTreasuryProposal.amountOfQubic) >= 0)
+                    {
+                        state.mut().reinvestingFund -= locals.updatedTreasuryProposal.amountOfQubic;
+                        locals.treasuryExecuted = 1;
+                    }
+                }
+                else if (locals.updatedTreasuryProposal.action == QVAULT_TREASURY_SEND_ASSET)
+                {
+                    CALL_OTHER_CONTRACT_FUNCTION(QX, Fees, locals.qxFees_input, locals.qxFees_output);
+                    if (locals.qxFees_output.transferFee <= state.get().reinvestingFund
+                        && qpi.numberOfPossessedShares(locals.updatedTreasuryProposal.assetName, locals.updatedTreasuryProposal.assetIssuer, SELF, SELF, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX) >= locals.updatedTreasuryProposal.numberOfShares
+                        && (locals.updatedTreasuryProposal.assetName != QVAULT_QCAP_ASSETNAME || locals.updatedTreasuryProposal.assetIssuer != state.get().QCAP_ISSUER
+                            || state.get().qcapSoldAmount + (uint64)locals.updatedTreasuryProposal.numberOfShares <= locals.qcapSaleLimit))
+                    {
+                        locals.qxTransfer_input.issuer = locals.updatedTreasuryProposal.assetIssuer;
+                        locals.qxTransfer_input.assetName = locals.updatedTreasuryProposal.assetName;
+                        locals.qxTransfer_input.numberOfShares = locals.updatedTreasuryProposal.numberOfShares;
+                        locals.qxTransfer_input.newOwnerAndPossessor = locals.updatedTreasuryProposal.destination;
+                        INVOKE_OTHER_CONTRACT_PROCEDURE(QX, TransferShareOwnershipAndPossession, locals.qxTransfer_input, locals.qxTransfer_output, locals.qxFees_output.transferFee);
+                        state.mut().reinvestingFund -= locals.qxFees_output.transferFee;
+                        if (locals.qxTransfer_output.transferredNumberOfShares == locals.updatedTreasuryProposal.numberOfShares)
+                        {
+                            if (locals.updatedTreasuryProposal.assetName == QVAULT_QCAP_ASSETNAME && locals.updatedTreasuryProposal.assetIssuer == state.get().QCAP_ISSUER)
+                            {
+                                state.mut().qcapSoldAmount += (uint32)locals.updatedTreasuryProposal.numberOfShares;
+                            }
+                            locals.treasuryExecuted = 1;
+                        }
+                    }
+                }
+                else if (locals.updatedTreasuryProposal.action == QVAULT_TREASURY_SELL_ASSET)
+                {
+                    if (qpi.numberOfPossessedShares(locals.updatedTreasuryProposal.assetName, locals.updatedTreasuryProposal.assetIssuer, SELF, SELF, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX) >= locals.updatedTreasuryProposal.numberOfShares)
+                    {
+                        locals.qxAsk_input.issuer = locals.updatedTreasuryProposal.assetIssuer;
+                        locals.qxAsk_input.assetName = locals.updatedTreasuryProposal.assetName;
+                        locals.qxAsk_input.price = locals.updatedTreasuryProposal.pricePerShare;
+                        locals.qxAsk_input.numberOfShares = locals.updatedTreasuryProposal.numberOfShares;
+                        INVOKE_OTHER_CONTRACT_PROCEDURE(QX, AddToAskOrder, locals.qxAsk_input, locals.qxAsk_output, 0);
+                        if (locals.qxAsk_output.addedNumberOfShares == locals.updatedTreasuryProposal.numberOfShares)
+                        {
+                            locals.treasuryExecuted = 1;
+                        }
+                    }
+                }
+                locals.updatedTreasuryProposal.result = locals.treasuryExecuted ? QVAULT_PROPOSAL_PASSED : QVAULT_PROPOSAL_EXECUTION_FAILED;
+            }
+            state.mut().TreasuryP.set(locals._t, locals.updatedTreasuryProposal);
+        }
+
+        /*
+            Poll Proposal Result
+            QVAULT's shares were already cast during the epoch (the poll's contract closes its poll before
+            QVAULT's END_EPOCH runs, because END_EPOCH runs from the highest contract index down). Only record the outcome.
+        */
+
+        for (locals._t = state.get().numberOfPollP - 1; locals._t >= 0; locals._t--)
+        {
+            if (state.get().PollP.get(locals._t).proposedEpoch != qpi.epoch())
+            {
+                break;
+            }
+            locals.updatedPollProposal = state.get().PollP.get(locals._t);
+            locals.updatedPollProposal.result = locals.updatedPollProposal.castOption >= 0 ? QVAULT_POLL_VOTED : QVAULT_POLL_NO_VOTES;
+            state.mut().PollP.set(locals._t, locals.updatedPollProposal);
         }
 
         state.mut().totalVotingPower = 0;
