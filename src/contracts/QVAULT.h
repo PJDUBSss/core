@@ -30,6 +30,10 @@ constexpr uint32 QVAULT_FAST_PROPOSAL_EFFECT_EPOCH = 243;
 // From this epoch on, staked (locked) QCAP stays in the staker's wallet instead of being held by QVAULT.
 // In BEGIN_EPOCH of this epoch, QCAP staked earlier is moved from QVAULT back to each staker's wallet, still locked.
 constexpr uint32 QVAULT_LOCK_IN_WALLET_EPOCH = 243;
+// With stakes in wallets, a staker who casts no vote in this many epochs in a row that had proposals is unlocked automatically
+constexpr uint8 QVAULT_INACTIVE_UNLOCK_MISSES = 2;
+constexpr uint8 QVAULT_STAKER_NEW = 255;                        // stakerMissedEpochs value of a staker added this epoch (could not vote yet)
+constexpr uint32 QVAULT_LOG_INACTIVE_STAKE_UNLOCKED = 2;       // Log type: lock removed after QVAULT_INACTIVE_UNLOCK_MISSES missed epochs
 // Treasury proposals (TreasuryP): release Qu from the reinvesting fund, send assets QVAULT holds, or sell assets on QX
 constexpr uint32 QVAULT_MAX_NUMBER_OF_TREASURY_PROPOSAL = 4096; // Maximum number of treasury proposals
 constexpr uint32 QVAULT_PROPOSAL_TYPE_TREASURY = 8;             // proposalType of TreasuryP in voteInProposal / getVoteInProposal
@@ -92,9 +96,10 @@ struct QVAULT2
 };
 
 /**
- * Log record written for every frozen identity whose staked QCAP is moved to FROZEN_ESCROW
- * @param frozenStaker Frozen identity that had the stake
- * @param amount Amount of QCAP moved to FROZEN_ESCROW
+ * Log record written for every frozen identity whose staked QCAP is moved to FROZEN_ESCROW (type 1),
+ * and for every inactive staker whose lock is removed automatically (type 2)
+ * @param frozenStaker Identity that had the stake
+ * @param amount Amount of QCAP moved to FROZEN_ESCROW (type 1) or unlocked (type 2)
  */
 struct QVAULTFrozenStakeLogger
 {
@@ -382,6 +387,7 @@ struct QVAULT : public ContractBase
         uint32 numberOfTreasuryP;           // Number of Treasury Proposals
         Array<PollPInfo, QVAULT_MAX_NUMBER_OF_POLL_PROPOSAL> PollP;               // Storage array for poll proposals
         uint32 numberOfPollP;               // Number of Poll Proposals
+        Array<uint8, QVAULT_X_MULTIPLIER> stakerMissedEpochs;  // Per staker[i]: epochs in a row with proposals and no vote (QVAULT_STAKER_NEW = added this epoch)
     };
 public:
 
@@ -986,6 +992,7 @@ public:
             locals.user.stakerAddress = qpi.invocator();
             state.mut().numberOfStaker++;
             locals.isNewStaker = 1;
+            state.mut().stakerMissedEpochs.set(locals._t, QVAULT_STAKER_NEW);
         }
         else 
         {
@@ -1088,6 +1095,8 @@ public:
                     {
                         state.mut().numberOfStaker--;
                         state.mut().staker.set(locals._t, state.get().staker.get(state.get().numberOfStaker));
+                        state.mut().stakerMissedEpochs.set(locals._t, state.get().stakerMissedEpochs.get(state.get().numberOfStaker));
+                        state.mut().stakerMissedEpochs.set(state.get().numberOfStaker, 0);
                     }
                 }
 
@@ -3989,6 +3998,8 @@ public:
 
                 state.mut().numberOfStaker--;
                 state.mut().staker.set(locals._t, state.get().staker.get(state.get().numberOfStaker));
+                state.mut().stakerMissedEpochs.set(locals._t, state.get().stakerMissedEpochs.get(state.get().numberOfStaker));
+                state.mut().stakerMissedEpochs.set(state.get().numberOfStaker, 0);
                 state.mut().staker.set(state.get().numberOfStaker, locals.emptyStake);
             }
 
@@ -4105,6 +4116,10 @@ public:
         TreasuryPInfo updatedTreasuryProposal;      // Updated treasury proposal
         PollPInfo updatedPollProposal;              // Updated poll proposal
         stakingInfo lockedStake;                    // Stake checked against the wallet's QCAP
+        QVAULTFrozenStakeLogger unlockLog;          // Log record for each automatic unlock
+        uint8 missedEpochs;                         // Missed epochs of a staker
+        uint8 stakerVotes;                          // Votes a staker cast this epoch
+        bit hadProposals;                           // Whether any proposal was open for voting this epoch
         stakingInfo emptyStake;                     // Zeroed entry used to clear vacated slots
         sint64 walletQcap;                          // QVAULT-managed QCAP in the staker's wallet
         QX::Fees_input qxFees_input;                // Input for QX fees query
@@ -4705,6 +4720,68 @@ public:
             state.mut().PollP.set(locals._t, locals.updatedPollProposal);
         }
 
+        // Inactive stakers: an epoch with at least one proposal in which a staker cast no vote is a miss; a vote resets
+        // the count. QVAULT_INACTIVE_UNLOCK_MISSES misses in a row remove the lock (the QCAP stays in the wallet).
+        // A staker added this epoch had no voting power yet and is not counted.
+        if (qvaultStakesInWallet(qpi.epoch()))
+        {
+            locals.hadProposals = (state.get().numberOfGP > 0 && state.get().GP.get(state.get().numberOfGP - 1).proposedEpoch == qpi.epoch())
+                || (state.get().numberOfQCP > 0 && state.get().QCP.get(state.get().numberOfQCP - 1).proposedEpoch == qpi.epoch())
+                || (state.get().numberOfIPOP > 0 && state.get().IPOP.get(state.get().numberOfIPOP - 1).proposedEpoch == qpi.epoch())
+                || (state.get().numberOfQEarnP > 0 && state.get().QEarnP.get(state.get().numberOfQEarnP - 1).proposedEpoch == qpi.epoch())
+                || (state.get().numberOfFundP > 0 && state.get().FundP.get(state.get().numberOfFundP - 1).proposedEpoch == qpi.epoch())
+                || (state.get().numberOfMKTP > 0 && state.get().MKTP.get(state.get().numberOfMKTP - 1).proposedEpoch == qpi.epoch())
+                || (state.get().numberOfAlloP > 0 && state.get().AlloP.get(state.get().numberOfAlloP - 1).proposedEpoch == qpi.epoch())
+                || (state.get().numberOfTreasuryP > 0 && state.get().TreasuryP.get(state.get().numberOfTreasuryP - 1).proposedEpoch == qpi.epoch())
+                || (state.get().numberOfPollP > 0 && state.get().PollP.get(state.get().numberOfPollP - 1).proposedEpoch == qpi.epoch());
+
+            locals._t = 0;
+            while (locals._t < (sint32)state.get().numberOfStaker)
+            {
+                locals.lockedStake = state.get().staker.get(locals._t);
+                locals.missedEpochs = state.get().stakerMissedEpochs.get(locals._t);
+                if (locals.missedEpochs == QVAULT_STAKER_NEW)
+                {
+                    state.mut().stakerMissedEpochs.set(locals._t, 0);
+                    locals._t++;
+                    continue;
+                }
+                if (!locals.hadProposals)
+                {
+                    locals._t++;
+                    continue;
+                }
+                locals.stakerVotes = 0;
+                state.get().countOfVote.get(locals.lockedStake.stakerAddress, locals.stakerVotes);
+                if (locals.stakerVotes > 0)
+                {
+                    state.mut().stakerMissedEpochs.set(locals._t, 0);
+                    locals._t++;
+                    continue;
+                }
+                locals.missedEpochs++;
+                if (locals.missedEpochs < QVAULT_INACTIVE_UNLOCK_MISSES)
+                {
+                    state.mut().stakerMissedEpochs.set(locals._t, locals.missedEpochs);
+                    locals._t++;
+                    continue;
+                }
+
+                state.mut().totalStakedQcapAmount -= locals.lockedStake.amount;
+                locals.unlockLog._contractIndex = SELF_INDEX;
+                locals.unlockLog._type = QVAULT_LOG_INACTIVE_STAKE_UNLOCKED;
+                locals.unlockLog.frozenStaker = locals.lockedStake.stakerAddress;
+                locals.unlockLog.amount = locals.lockedStake.amount;
+                LOG_INFO(locals.unlockLog);
+
+                state.mut().numberOfStaker--;
+                state.mut().staker.set(locals._t, state.get().staker.get(state.get().numberOfStaker));
+                state.mut().staker.set(state.get().numberOfStaker, locals.emptyStake);
+                state.mut().stakerMissedEpochs.set(locals._t, state.get().stakerMissedEpochs.get(state.get().numberOfStaker));
+                state.mut().stakerMissedEpochs.set(state.get().numberOfStaker, 0);
+            }
+        }
+
         // a lock can never be worth more than the QVAULT-managed QCAP the wallet still holds
         // (the core can move shares of frozen addresses regardless of locks)
         if (qvaultStakesInWallet(qpi.epoch()))
@@ -4730,6 +4807,8 @@ public:
                 {
                     state.mut().numberOfStaker--;
                     state.mut().staker.set(locals._t, state.get().staker.get(state.get().numberOfStaker));
+                    state.mut().stakerMissedEpochs.set(locals._t, state.get().stakerMissedEpochs.get(state.get().numberOfStaker));
+                    state.mut().stakerMissedEpochs.set(state.get().numberOfStaker, 0);
                     state.mut().staker.set(state.get().numberOfStaker, locals.emptyStake);
                 }
             }

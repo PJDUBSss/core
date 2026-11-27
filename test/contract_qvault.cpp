@@ -1540,3 +1540,115 @@ TEST(TestContractQvault, stakedQcapLockedInWallet)
     EXPECT_EQ(qvault.TransferShareManagementRights(stakerA, qcap, 5000, QX_CONTRACT_INDEX), 5000u);
     EXPECT_EQ(walletQcap(stakerA), 0);
 }
+
+TEST(TestContractQvault, inactiveStakersUnlockedAfterTwoMissedEpochs)
+{
+    system.epoch = QVAULT_LOCK_IN_WALLET_EPOCH;
+    ContractTestingQvault qvault;
+    QVAULTChecker* state = qvault.getState();
+
+    const uint64 qcapAssetName = assetNameFromString("QCAP");
+    Asset qcap;
+    qcap.assetName = qcapAssetName;
+    qcap.issuer = QVAULT_QCAP_ISSUER;
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_ISSUE_ASSET_FEE);
+    EXPECT_EQ(qvault.issueAsset(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, 0, 0), QVAULT_QCAP_MAX_SUPPLY);
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID), QVAULT_QCAP_MAX_SUPPLY);
+
+    auto stakeQcap = [&](const id& user, uint32 amount)
+    {
+        increaseEnergy(QVAULT_CONTRACT_ID, QVAULT_TOKEN_TRANSFER_FEE);
+        EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, amount, QVAULT_CONTRACT_ID, user), amount);
+        increaseEnergy(user, QVAULT_UNSTAKE_FEE);
+        EXPECT_EQ(qvault.QXTransferShareManagementRights(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_CONTRACT_INDEX, amount, user), amount);
+        EXPECT_EQ(qvault.stake(user, amount), QVAULT_SUCCESS);
+    };
+    auto isStaker = [&](const id& user)
+    {
+        for (uint32 i = 0; i < state->numberOfStaker; i++)
+            if (state->staker.get(i).stakerAddress == user)
+                return true;
+        return false;
+    };
+    // a general proposal open for voting in the current epoch (set directly; submitting is tested elsewhere)
+    auto openProposal = [&]()
+    {
+        QVAULT::GPInfo gp;
+        setMemory(gp, 0);
+        gp.proposedEpoch = system.epoch;
+        gp.currentQuorumPercent = 670;
+        gp.currentTotalVotingPower = state->totalVotingPower;
+        gp.result = QVAULT_PROPOSAL_NOT_STARTED;
+        state->GP.set(state->numberOfGP, gp);
+        state->numberOfGP++;
+        return state->numberOfGP - 1;
+    };
+
+    const id stakerA = getUser(1);
+    const id stakerB = getUser(2);
+    const id stakerC = getUser(3);
+    stakeQcap(stakerA, 1000);
+    stakeQcap(stakerB, 1000);
+    stakeQcap(stakerC, 1000);
+    openProposal();
+    qvault.endEpoch();                               // new stakers could not vote yet: no miss
+    EXPECT_EQ(state->numberOfStaker, 3u);
+
+    // epoch +1: proposal, only A votes -> B and C miss once
+    system.epoch++;
+    uint32 gp = openProposal();
+    EXPECT_EQ(qvault.voteInProposal(stakerA, 0, 1, gp, 1), QVAULT_SUCCESS);
+    qvault.endEpoch();
+    EXPECT_EQ(state->numberOfStaker, 3u);
+
+    // epoch +2: no proposals -> nobody misses, counts kept
+    system.epoch++;
+    const id stakerD = getUser(4);
+    stakeQcap(stakerD, 1000);                         // joins this epoch
+    qvault.endEpoch();
+    EXPECT_EQ(state->numberOfStaker, 4u);
+
+    // epoch +3: proposal, A and B vote, C does not -> C's second miss in a row unlocks C; D gets a first miss
+    system.epoch++;
+    gp = openProposal();
+    EXPECT_EQ(qvault.voteInProposal(stakerA, 0, 1, gp, 1), QVAULT_SUCCESS);
+    EXPECT_EQ(qvault.voteInProposal(stakerB, 0, 1, gp, 1), QVAULT_SUCCESS);
+    qvault.endEpoch();
+    EXPECT_EQ(state->numberOfStaker, 3u);
+    EXPECT_TRUE(isStaker(stakerA));
+    EXPECT_TRUE(isStaker(stakerB));
+    EXPECT_FALSE(isStaker(stakerC));
+    EXPECT_TRUE(isStaker(stakerD));
+    EXPECT_EQ(state->totalStakedQcapAmount, 3000u);
+    EXPECT_EQ(state->totalVotingPower, 3000u);
+
+    // C's QCAP never left C's wallet and is free to move now
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, stakerC, stakerC, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), 1000);
+    increaseEnergy(stakerC, 1000);
+    EXPECT_EQ(qvault.TransferShareManagementRights(stakerC, qcap, 1000, QX_CONTRACT_INDEX), 1000u);
+
+    // epoch +4: proposal, only B votes: A misses once, D misses a second time in a row -> D unlocked
+    system.epoch++;
+    gp = openProposal();
+    EXPECT_EQ(qvault.voteInProposal(stakerB, 0, 1, gp, 1), QVAULT_SUCCESS);
+    qvault.endEpoch();
+    EXPECT_TRUE(isStaker(stakerA));
+    EXPECT_TRUE(isStaker(stakerB));
+    EXPECT_FALSE(isStaker(stakerD));
+    EXPECT_EQ(state->numberOfStaker, 2u);
+
+    // epoch +5: A votes in time and stays
+    system.epoch++;
+    gp = openProposal();
+    EXPECT_EQ(qvault.voteInProposal(stakerA, 0, 1, gp, 1), QVAULT_SUCCESS);
+    qvault.endEpoch();
+    EXPECT_TRUE(isStaker(stakerA));
+    EXPECT_TRUE(isStaker(stakerB));                   // B missed once only
+
+    // an unlocked staker can lock again
+    system.epoch++;
+    increaseEnergy(stakerD, QVAULT_UNSTAKE_FEE);
+    EXPECT_EQ(qvault.stake(stakerD, 1000), QVAULT_SUCCESS);
+    EXPECT_TRUE(isStaker(stakerD));
+}
