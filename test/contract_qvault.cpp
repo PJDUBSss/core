@@ -1029,7 +1029,11 @@ TEST(TestContractQvault, frozenStakeMovedToEscrowOnce)
 
     // frozen stake is now in FROZEN_ESCROW, still managed by QVAULT
     EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, escrow, escrow, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), frozenAmount);
-    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), qvaultQcapBefore - frozenAmount);
+    // QVAULT_LOCK_IN_WALLET_EPOCH is the same epoch: all stakes left QVAULT; the normal stake is locked in its wallet
+    static_assert(QVAULT_LOCK_IN_WALLET_EPOCH == QVAULT_FROZEN_STAKE_ESCROW_EPOCH, "test assumes both one-shot moves run in the same epoch");
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_ID, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), qvaultQcapBefore - frozenAmount - normalAmount);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, normalStaker, normalStaker, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), normalAmount);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, frozenStaker, frozenStaker, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX), 0);
 
     // only the normal staker is left in both lists
     QVAULTChecker* state = qvault.getState();
@@ -1435,4 +1439,104 @@ TEST(TestContractQvault, pollProposalCastsSharesLive)
     // closed in later epochs
     system.epoch++;
     EXPECT_EQ(qvault.voteInPollP(stakerB, 0, 0).returnCode, QVAULT_ENDED_PROPOSAL);
+}
+
+TEST(TestContractQvault, stakedQcapLockedInWallet)
+{
+    system.epoch = QVAULT_LOCK_IN_WALLET_EPOCH - 2;
+    ContractTestingQvault qvault;
+    QVAULTChecker* state = qvault.getState();
+
+    const uint64 qcapAssetName = assetNameFromString("QCAP");
+    Asset qcap;
+    qcap.assetName = qcapAssetName;
+    qcap.issuer = QVAULT_QCAP_ISSUER;
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_ISSUE_ASSET_FEE);
+    EXPECT_EQ(qvault.issueAsset(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, 0, 0), QVAULT_QCAP_MAX_SUPPLY);
+    increaseEnergy(QVAULT_QCAP_ISSUER, QVAULT_TOKEN_TRANSFER_FEE);
+    EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_QCAP_MAX_SUPPLY, QVAULT_QCAP_ISSUER, QVAULT_CONTRACT_ID), QVAULT_QCAP_MAX_SUPPLY);
+
+    // gives a user QVAULT-managed QCAP
+    auto giveQcap = [&](const id& user, uint32 amount)
+    {
+        increaseEnergy(QVAULT_CONTRACT_ID, QVAULT_TOKEN_TRANSFER_FEE);
+        EXPECT_EQ(qvault.TransferShareOwnershipAndPossession(QVAULT_QCAP_ISSUER, qcapAssetName, amount, QVAULT_CONTRACT_ID, user), amount);
+        increaseEnergy(user, QVAULT_UNSTAKE_FEE);
+        EXPECT_EQ(qvault.QXTransferShareManagementRights(QVAULT_QCAP_ISSUER, qcapAssetName, QVAULT_CONTRACT_INDEX, amount, user), amount);
+    };
+    auto walletQcap = [&](const id& user)
+    {
+        return numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, user, user, QVAULT_CONTRACT_INDEX, QVAULT_CONTRACT_INDEX);
+    };
+
+    // before the switch: A stakes 5000 and the QCAP moves into QVAULT
+    const id stakerA = getUser(1);
+    giveQcap(stakerA, 5000);
+    EXPECT_EQ(qvault.stake(stakerA, 5000), QVAULT_SUCCESS);
+    EXPECT_EQ(walletQcap(stakerA), 0);
+    const sint64 qvaultHeldBefore = walletQcap(QVAULT_CONTRACT_ID);
+    EXPECT_EQ(qvaultHeldBefore, 5000);
+    qvault.endEpoch();
+
+    system.epoch = QVAULT_LOCK_IN_WALLET_EPOCH - 1;
+    qvault.beginEpoch();
+    EXPECT_EQ(walletQcap(stakerA), 0);           // nothing moves before the switch epoch
+    qvault.endEpoch();
+
+    // switch epoch: A's stake goes back to A's wallet and stays locked
+    system.epoch = QVAULT_LOCK_IN_WALLET_EPOCH;
+    qvault.beginEpoch();
+    EXPECT_EQ(walletQcap(stakerA), 5000);
+    EXPECT_EQ(walletQcap(QVAULT_CONTRACT_ID), qvaultHeldBefore - 5000);
+    EXPECT_EQ(state->numberOfStaker, 1u);
+    EXPECT_EQ(state->staker.get(0).amount, 5000u);
+    EXPECT_EQ(state->totalStakedQcapAmount, 5000u);
+
+    // locked QCAP cannot leave QVAULT management, unlocked QCAP can
+    increaseEnergy(stakerA, 1000);
+    EXPECT_EQ(qvault.TransferShareManagementRights(stakerA, qcap, 1, QX_CONTRACT_INDEX), 0u);
+    giveQcap(stakerA, 1000);
+    EXPECT_EQ(qvault.TransferShareManagementRights(stakerA, qcap, 1001, QX_CONTRACT_INDEX), 0u);
+    EXPECT_EQ(qvault.TransferShareManagementRights(stakerA, qcap, 1000, QX_CONTRACT_INDEX), 1000u);
+    EXPECT_EQ(walletQcap(stakerA), 5000);
+    EXPECT_EQ(numberOfPossessedShares(qcapAssetName, QVAULT_QCAP_ISSUER, stakerA, stakerA, QX_CONTRACT_INDEX, QX_CONTRACT_INDEX), 1000);
+
+    // locked QCAP cannot be locked twice
+    EXPECT_EQ(qvault.stake(stakerA, 100), QVAULT_INSUFFICIENT_QCAP);
+
+    // new staker B: QCAP stays in B's wallet
+    const id stakerB = getUser(2);
+    giveQcap(stakerB, 3000);
+    const sint64 qvaultHeld = walletQcap(QVAULT_CONTRACT_ID);
+    EXPECT_EQ(qvault.stake(stakerB, 3000), QVAULT_SUCCESS);
+    EXPECT_EQ(walletQcap(stakerB), 3000);
+    EXPECT_EQ(walletQcap(QVAULT_CONTRACT_ID), qvaultHeld);
+    EXPECT_EQ(state->totalStakedQcapAmount, 8000u);
+    increaseEnergy(stakerB, 1000);
+    EXPECT_EQ(qvault.TransferShareManagementRights(stakerB, qcap, 1, QX_CONTRACT_INDEX), 0u);
+
+    // stakers are paid once, for the QCAP in their wallets: A holds 6000 (5000 locked + 1000 on QX), B 3000
+    const uint64 revenue = 1000000000000ull;
+    increaseEnergy(QVAULT_CONTRACT_ID, revenue);
+    state->totalEpochRevenue = revenue;
+    const sint64 balanceA = getBalance(stakerA);
+    const sint64 balanceB = getBalance(stakerB);
+    qvault.endEpoch();
+    const sint64 paidA = getBalance(stakerA) - balanceA;
+    const sint64 paidB = getBalance(stakerB) - balanceB;
+    EXPECT_GT(paidB, 0);
+    EXPECT_EQ(paidA, 2 * paidB);
+
+    // voting power follows the locks
+    EXPECT_EQ(state->numberOfVotingPower, 2u);
+    EXPECT_EQ(state->totalVotingPower, 8000u);
+
+    // unstaking unlocks; the QCAP never moved, and can now leave QVAULT management
+    system.epoch++;
+    increaseEnergy(stakerA, QVAULT_UNSTAKE_FEE);
+    EXPECT_EQ(qvault.unStake(stakerA, 5000), QVAULT_SUCCESS);
+    EXPECT_EQ(walletQcap(stakerA), 5000);
+    EXPECT_EQ(state->totalStakedQcapAmount, 3000u);
+    EXPECT_EQ(qvault.TransferShareManagementRights(stakerA, qcap, 5000, QX_CONTRACT_INDEX), 5000u);
+    EXPECT_EQ(walletQcap(stakerA), 0);
 }

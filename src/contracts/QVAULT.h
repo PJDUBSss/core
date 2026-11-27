@@ -27,6 +27,9 @@ constexpr uint32 QVAULT_LOG_FROZEN_STAKE_ESCROWED = 1; // Log type: staked QCAP 
 // Proposals submitted from this epoch on take effect as soon as the next epoch begins (QCP, AlloP, FundP sale).
 // Proposals submitted earlier keep the old timing of one extra epoch, so nothing already scheduled is skipped.
 constexpr uint32 QVAULT_FAST_PROPOSAL_EFFECT_EPOCH = 243;
+// From this epoch on, staked (locked) QCAP stays in the staker's wallet instead of being held by QVAULT.
+// In BEGIN_EPOCH of this epoch, QCAP staked earlier is moved from QVAULT back to each staker's wallet, still locked.
+constexpr uint32 QVAULT_LOCK_IN_WALLET_EPOCH = 243;
 // Treasury proposals (TreasuryP): release Qu from the reinvesting fund, send assets QVAULT holds, or sell assets on QX
 constexpr uint32 QVAULT_MAX_NUMBER_OF_TREASURY_PROPOSAL = 4096; // Maximum number of treasury proposals
 constexpr uint32 QVAULT_PROPOSAL_TYPE_TREASURY = 8;             // proposalType of TreasuryP in voteInProposal / getVoteInProposal
@@ -775,6 +778,12 @@ public:
 		sint64 transferredNumberOfShares;
 		sint32 returnCode;
 	};
+
+	struct TransferShareManagementRights_locals
+	{
+		sint64 locked;                  // QCAP of the invocator locked in their wallet
+		sint32 _t;                      // Loop counter variable
+	};
     /**
      * @return pack qvault datetime data from year, month, day, hour, minute, second to a uint32
      * year is counted from 24 (2024)
@@ -788,6 +797,14 @@ public:
      * @return first epoch in which a passed QCP, AlloP or FundP takes effect
      * Voting ends when the proposal's epoch ends; from QVAULT_FAST_PROPOSAL_EFFECT_EPOCH on the result applies in the very next epoch
      */
+     /**
+     * @return whether staked QCAP is locked in the stakers' wallets (true) or held by QVAULT (false) in this epoch
+     */
+     inline static bit qvaultStakesInWallet(uint32 epoch)
+     {
+         return epoch >= QVAULT_LOCK_IN_WALLET_EPOCH;
+     }
+
      inline static uint32 qvaultProposalEffectEpoch(uint32 proposedEpoch)
      {
          return proposedEpoch >= QVAULT_FAST_PROPOSAL_EFFECT_EPOCH ? proposedEpoch + 1 : proposedEpoch + 2;
@@ -880,7 +897,7 @@ public:
         locals.qcapAsset.assetName = QVAULT_QCAP_ASSETNAME;
         locals.qcapAsset.issuer = state.get().QCAP_ISSUER;
 
-        output.circulatingSupply = (uint32)(qpi.numberOfShares(locals.qcapAsset) - qpi.numberOfShares(locals.qcapAsset, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) + state.get().totalStakedQcapAmount);
+        output.circulatingSupply = (uint32)(qpi.numberOfShares(locals.qcapAsset) - qpi.numberOfShares(locals.qcapAsset, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) + (qvaultStakesInWallet(qpi.epoch()) ? 0 : state.get().totalStakedQcapAmount));
         for (locals._t = state.get().numberOfFundP - 1; locals._t >= 0; locals._t--)
         {
             if (state.get().FundP.get(locals._t).result == 0 && qvaultProposalEffectEpoch(state.get().FundP.get(locals._t).proposedEpoch) <= qpi.epoch())
@@ -900,6 +917,7 @@ public:
     struct stake_locals
     {
         stakingInfo user;               // User staking information
+        uint32 alreadyLocked;           // QCAP of the user already locked in their wallet
         sint32 _t;                      // Loop counter variable
         bool isNewStaker;               // Flag to check if the user is a new staker
         uint8 actionsFlag;              // Flag to check if the user already stake in this epoch
@@ -907,7 +925,9 @@ public:
 
     /**
      * Stakes QCAP tokens to earn voting power and revenue
-     * Transfers QCAP tokens from user to contract and updates staking records
+     * Before QVAULT_LOCK_IN_WALLET_EPOCH: transfers QCAP tokens from user to contract and updates staking records.
+     * From QVAULT_LOCK_IN_WALLET_EPOCH on: the QCAP stays in the user's wallet and is locked there
+     * (it cannot leave QVAULT management until unstaked).
      * 
      * @param input Amount of QCAP tokens to stake
      * @param output Status code indicating success or failure
@@ -919,7 +939,22 @@ public:
             qpi.transfer(qpi.invocator(), qpi.invocationReward());
         }
 
-        if (input.amount > (uint32)qpi.numberOfPossessedShares(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, qpi.invocator(), qpi.invocator(), SELF_INDEX, SELF_INDEX))
+        for (locals._t = 0 ; locals._t < (sint32)state.get().numberOfStaker; locals._t++)
+        {
+            if (state.get().staker.get(locals._t).stakerAddress == qpi.invocator())
+            {
+                break;
+            }
+        }
+
+        // with stakes kept in the wallet, the QCAP already locked there cannot be locked again
+        locals.alreadyLocked = 0;
+        if (qvaultStakesInWallet(qpi.epoch()) && locals._t < (sint32)state.get().numberOfStaker)
+        {
+            locals.alreadyLocked = state.get().staker.get(locals._t).amount;
+        }
+
+        if ((uint64)input.amount + locals.alreadyLocked > (uint64)qpi.numberOfPossessedShares(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, qpi.invocator(), qpi.invocator(), SELF_INDEX, SELF_INDEX))
         {
             output.returnCode = QVAULT_INSUFFICIENT_QCAP;
             return ;
@@ -937,14 +972,6 @@ public:
             {
                 output.returnCode = QVAULT_STAKE_ALREADY_DONE;
                 return ;
-            }
-        }
-
-        for (locals._t = 0 ; locals._t < (sint32)state.get().numberOfStaker; locals._t++)
-        {
-            if (state.get().staker.get(locals._t).stakerAddress == qpi.invocator())
-            {
-                break;
             }
         }
 
@@ -966,7 +993,8 @@ public:
             locals.user.stakerAddress = state.get().staker.get(locals._t).stakerAddress;
         }
 
-        if (qpi.transferShareOwnershipAndPossession(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, qpi.invocator(), qpi.invocator(), input.amount, SELF) < 0)
+        if (!qvaultStakesInWallet(qpi.epoch())
+            && qpi.transferShareOwnershipAndPossession(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, qpi.invocator(), qpi.invocator(), input.amount, SELF) < 0)
         {
             if (locals.isNewStaker == 1)
             {
@@ -995,7 +1023,8 @@ public:
 
     /**
      * Unstakes QCAP tokens, reducing voting power
-     * Transfers QCAP tokens back to user and updates staking records
+     * Before QVAULT_LOCK_IN_WALLET_EPOCH: transfers QCAP tokens back to user and updates staking records.
+     * From QVAULT_LOCK_IN_WALLET_EPOCH on: only unlocks the QCAP, which is already in the user's wallet.
      * 
      * @param input Amount of QCAP tokens to unstake
      * @param output Status code indicating success or failure
@@ -1040,7 +1069,8 @@ public:
                 }
                 else if (state.get().staker.get(locals._t).amount >= input.amount)
                 {
-                    if (qpi.transferShareOwnershipAndPossession(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, SELF, SELF, input.amount, qpi.invocator()) < 0)
+                    if (!qvaultStakesInWallet(qpi.epoch())
+                        && qpi.transferShareOwnershipAndPossession(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, SELF, SELF, input.amount, qpi.invocator()) < 0)
                     {
                         output.returnCode = QVAULT_INSUFFICIENT_QCAP;
                         return ;
@@ -2724,7 +2754,7 @@ public:
      * @param input Asset information, number of shares, and new managing contract index
      * @param output Number of shares transferred and status code
      */
-	PUBLIC_PROCEDURE(TransferShareManagementRights)
+	PUBLIC_PROCEDURE_WITH_LOCALS(TransferShareManagementRights)
     {
 		if (qpi.invocationReward() < state.get().transferRightsFee)
 		{
@@ -2732,7 +2762,21 @@ public:
 			return ;
 		}
 
-		if (qpi.numberOfPossessedShares(input.asset.assetName, input.asset.issuer,qpi.invocator(), qpi.invocator(), SELF_INDEX, SELF_INDEX) < input.numberOfShares)
+		// QCAP locked in the wallet (staked) cannot leave QVAULT management
+		locals.locked = 0;
+		if (qvaultStakesInWallet(qpi.epoch()) && input.asset.assetName == QVAULT_QCAP_ASSETNAME && input.asset.issuer == state.get().QCAP_ISSUER)
+		{
+			for (locals._t = 0 ; locals._t < (sint32)state.get().numberOfStaker; locals._t++)
+			{
+				if (state.get().staker.get(locals._t).stakerAddress == qpi.invocator())
+				{
+					locals.locked = state.get().staker.get(locals._t).amount;
+					break;
+				}
+			}
+		}
+
+		if (qpi.numberOfPossessedShares(input.asset.assetName, input.asset.issuer,qpi.invocator(), qpi.invocator(), SELF_INDEX, SELF_INDEX) - locals.locked < input.numberOfShares)
 		{
 			// not enough shares available
 			output.transferredNumberOfShares = 0;
@@ -3589,7 +3633,7 @@ public:
         locals.numberOfDuplicatedPossesor = (uint32)div(locals.numberOfDuplicatedPossesor * 1ULL, 2ULL);
 
         output.numberOfQcapHolder = locals.count - locals.numberOfDuplicatedPossesor;
-        output.avgAmount = (uint32)div(qpi.numberOfShares(locals.QCAPId) - qpi.numberOfShares(locals.QCAPId, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) + state.get().totalStakedQcapAmount * 1ULL, output.numberOfQcapHolder * 1ULL);
+        output.avgAmount = (uint32)div(qpi.numberOfShares(locals.QCAPId) - qpi.numberOfShares(locals.QCAPId, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) + (qvaultStakesInWallet(qpi.epoch()) ? 0ULL : state.get().totalStakedQcapAmount * 1ULL), output.numberOfQcapHolder * 1ULL);
         output.returnCode = QVAULT_SUCCESS;
     }
 
@@ -3883,6 +3927,7 @@ public:
         stakingInfo frozenStake;                                                // Stake entry checked during the frozen stake escrow move
         stakingInfo emptyStake;                                                 // Zeroed entry used to clear vacated slots
         id frozenEscrow;                                                        // FROZEN_ESCROW identity (see public_settings.h)
+        id stakeHolder;                                                         // Current holder of a frozen stake (QVAULT or the frozen wallet)
         QVAULTFrozenStakeLogger frozenStakeLog;                                 // Log record for each escrowed frozen stake
     };
 
@@ -3897,6 +3942,20 @@ public:
         // Frozen identities cannot send transactions, so their stake could never be unstaked or voted with.
         // The core already moved their qus and wallet-held shares to FROZEN_ESCROW; staked QCAP is owned by
         // this contract and was not covered. Owners recover it from FROZEN_ESCROW like their other frozen assets.
+        // One-shot move of QCAP staked so far from QVAULT back to the stakers' wallets, where it stays locked.
+        // Runs before the frozen stake escrow move below, which then takes frozen stakes from the frozen wallets.
+        if (qpi.epoch() == QVAULT_LOCK_IN_WALLET_EPOCH)
+        {
+            for (locals._t = 0; locals._t < (sint32)state.get().numberOfStaker; locals._t++)
+            {
+                locals.frozenStake = state.get().staker.get(locals._t);
+                if (locals.frozenStake.amount > 0)
+                {
+                    qpi.transferShareOwnershipAndPossession(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, SELF, SELF, locals.frozenStake.amount, locals.frozenStake.stakerAddress);
+                }
+            }
+        }
+
         if (qpi.epoch() == QVAULT_FROZEN_STAKE_ESCROW_EPOCH)
         {
             locals.frozenEscrow = ID(_X, _M, _G, _U, _N, _W, _J, _Y, _L, _L, _U, _U, _Z, _A, _N, _F, _E, _W, _J, _N, _N, _I, _D, _M, _X, _N, _S, _D, _M, _P, _O, _V, _F, _A, _H, _W, _O, _E, _R, _K, _D, _D, _A, _W, _D, _R, _E, _Z, _L, _A, _N, _H, _T, _F, _J, _B);
@@ -3912,7 +3971,9 @@ public:
                     continue;
                 }
 
-                if (qpi.transferShareOwnershipAndPossession(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, SELF, SELF, locals.frozenStake.amount, locals.frozenEscrow) < 0)
+                // stake is held by QVAULT, or (with stakes in wallets) by the frozen wallet under QVAULT management
+                locals.stakeHolder = qvaultStakesInWallet(qpi.epoch()) ? locals.frozenStake.stakerAddress : SELF;
+                if (qpi.transferShareOwnershipAndPossession(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, locals.stakeHolder, locals.stakeHolder, locals.frozenStake.amount, locals.frozenEscrow) < 0)
                 {
                     locals._t++;
                     continue;
@@ -4043,6 +4104,9 @@ public:
         AlloPInfo updatedAlloProposal;              // Updated allocation proposal
         TreasuryPInfo updatedTreasuryProposal;      // Updated treasury proposal
         PollPInfo updatedPollProposal;              // Updated poll proposal
+        stakingInfo lockedStake;                    // Stake checked against the wallet's QCAP
+        stakingInfo emptyStake;                     // Zeroed entry used to clear vacated slots
+        sint64 walletQcap;                          // QVAULT-managed QCAP in the staker's wallet
         QX::Fees_input qxFees_input;                // Input for QX fees query
         QX::Fees_output qxFees_output;              // QX fees (transfer fee paid for SEND_ASSET)
         QX::TransferShareOwnershipAndPossession_input qxTransfer_input;     // Input for QX share transfer
@@ -4103,7 +4167,9 @@ public:
         locals.QCAPId.assetName = QVAULT_QCAP_ASSETNAME;
         locals.QCAPId.issuer = state.get().QCAP_ISSUER;
 
-        locals.circulatedSupply = qpi.numberOfShares(locals.QCAPId) - qpi.numberOfShares(locals.QCAPId, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) + state.get().totalStakedQcapAmount;
+        // while QVAULT held staked QCAP, it was added back here and paid to stakers separately below;
+        // with stakes in the wallets, stakers are paid through their wallet holdings like everyone else
+        locals.circulatedSupply = qpi.numberOfShares(locals.QCAPId) - qpi.numberOfShares(locals.QCAPId, AssetOwnershipSelect::byOwner(SELF), AssetPossessionSelect::byPossessor(SELF)) + (qvaultStakesInWallet(qpi.epoch()) ? 0 : state.get().totalStakedQcapAmount);
 
         locals.revenueForOneQcap = div(locals.paymentForQCAPHolders, locals.circulatedSupply * 1ULL);
         state.mut().totalEpochRevenue -= smul(locals.revenueForOneQcap, locals.circulatedSupply);
@@ -4131,9 +4197,12 @@ public:
             locals.iter.next();
         }
 
-        for (locals._t = 0 ; locals._t < (sint32)state.get().numberOfStaker; locals._t++)
+        if (!qvaultStakesInWallet(qpi.epoch()))
         {
-            qpi.transfer(state.get().staker.get(locals._t).stakerAddress, div(locals.paymentForQCAPHolders, locals.circulatedSupply) * state.get().staker.get(locals._t).amount);
+            for (locals._t = 0 ; locals._t < (sint32)state.get().numberOfStaker; locals._t++)
+            {
+                qpi.transfer(state.get().staker.get(locals._t).stakerAddress, div(locals.paymentForQCAPHolders, locals.circulatedSupply) * state.get().staker.get(locals._t).amount);
+            }
         }
 
         /*
@@ -4634,6 +4703,36 @@ public:
             locals.updatedPollProposal = state.get().PollP.get(locals._t);
             locals.updatedPollProposal.result = locals.updatedPollProposal.castOption >= 0 ? QVAULT_POLL_VOTED : QVAULT_POLL_NO_VOTES;
             state.mut().PollP.set(locals._t, locals.updatedPollProposal);
+        }
+
+        // a lock can never be worth more than the QVAULT-managed QCAP the wallet still holds
+        // (the core can move shares of frozen addresses regardless of locks)
+        if (qvaultStakesInWallet(qpi.epoch()))
+        {
+            locals._t = 0;
+            while (locals._t < (sint32)state.get().numberOfStaker)
+            {
+                locals.lockedStake = state.get().staker.get(locals._t);
+                locals.walletQcap = qpi.numberOfPossessedShares(QVAULT_QCAP_ASSETNAME, state.get().QCAP_ISSUER, locals.lockedStake.stakerAddress, locals.lockedStake.stakerAddress, SELF_INDEX, SELF_INDEX);
+                if (locals.walletQcap >= locals.lockedStake.amount)
+                {
+                    locals._t++;
+                    continue;
+                }
+                state.mut().totalStakedQcapAmount -= locals.lockedStake.amount - (uint32)locals.walletQcap;
+                locals.lockedStake.amount = (uint32)locals.walletQcap;
+                if (locals.lockedStake.amount > 0)
+                {
+                    state.mut().staker.set(locals._t, locals.lockedStake);
+                    locals._t++;
+                }
+                else
+                {
+                    state.mut().numberOfStaker--;
+                    state.mut().staker.set(locals._t, state.get().staker.get(state.get().numberOfStaker));
+                    state.mut().staker.set(state.get().numberOfStaker, locals.emptyStake);
+                }
+            }
         }
 
         state.mut().totalVotingPower = 0;
